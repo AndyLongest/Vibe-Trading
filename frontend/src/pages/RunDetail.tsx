@@ -33,7 +33,7 @@ import { MetricsCard } from "@/components/chat/MetricsCard";
 import { ValidationPanel } from "@/components/charts/ValidationPanel";
 import { Skeleton, SkeletonMetrics, SkeletonChart } from "@/components/common/Skeleton";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
-import { StrategyResearchDashboard } from "@/components/charts/StrategyResearchDashboard";
+import { getStrategyReportIdentity, StrategyResearchDashboard } from "@/components/charts/StrategyResearchDashboard";
 
 const rehypePlugins = [rehypeHighlight];
 
@@ -206,6 +206,7 @@ export function RunDetail() {
 
   const ok = run.status === "success";
   const cancelled = run.status === "cancelled";
+  const reportIdentity = getStrategyReportIdentity(run);
 
   async function loadChartSymbol(
     symbol: string,
@@ -322,7 +323,10 @@ export function RunDetail() {
               <span className="sr-only">{t("swarm.status.failed")}</span>
             </>
           )}
-          <h1 className="font-mono text-2xl font-semibold">{runId}</h1>
+          <div className="min-w-0">
+            <h1 className="truncate text-xl font-semibold tracking-tight">{reportIdentity.title}</h1>
+            <p className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">RUN {runId}</p>
+          </div>
           {run.elapsed_seconds && <span className="text-xs text-muted-foreground">{run.elapsed_seconds.toFixed(1)}s</span>}
         </div>
         {run.prompt && <p className="text-sm text-muted-foreground">{run.prompt}</p>}

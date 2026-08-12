@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
+import { CalendarRange, Database, FlaskConical } from "lucide-react";
 import i18n from "@/i18n";
 import { echarts } from "@/lib/echarts";
 import { getChartTheme } from "@/lib/chart-theme";
@@ -32,6 +33,64 @@ function pct(value: unknown, digits = 1): string {
 
 function timestamp(row: Record<string, string>): string {
   return row.timestamp || row.time || row.date || "";
+}
+
+type ReportIdentity = {
+  title: string;
+  strategy: string;
+  symbols: string[];
+  startDate: string;
+  endDate: string;
+  source: string;
+  engine: string;
+};
+
+function compactPrompt(prompt: string): string {
+  const firstClause = prompt.trim().split(/[。.!！?？;；\n]/, 1)[0] || "";
+  return firstClause.length > 68 ? `${firstClause.slice(0, 65).trim()}…` : firstClause;
+}
+
+function inferStrategyName(prompt: string): string {
+  const zhMa = prompt.match(/(\d+)\s*(?:日|天)?\s*[\/／-]\s*(\d+)\s*(?:日|天)?[^。；,，]{0,18}均线/i)
+    || prompt.match(/(\d+)\s*日均线[^。；,，]{0,18}(\d+)\s*日均线/i);
+  if (zhMa) return `${zhMa[1]}/${zhMa[2]} 日均线交叉策略`;
+
+  const enMa = prompt.match(/(\d+)\s*[\/\-]\s*(\d+)[^.!?]{0,28}(?:moving[ -]?average|\bma\b)/i)
+    || prompt.match(/(?:moving[ -]?average|\bma\b)[^.!?]{0,28}(\d+)\s*[\/\-]\s*(\d+)/i);
+  if (enMa) return `${enMa[1]}/${enMa[2]}-day moving-average crossover`;
+
+  if (/macd/i.test(prompt)) return "MACD 趋势策略";
+  if (/rsi/i.test(prompt)) return "RSI 择时策略";
+  if (/动量|momentum/i.test(prompt)) return "动量策略";
+  if (/均值回归|mean reversion/i.test(prompt)) return "均值回归策略";
+  if (/突破|breakout/i.test(prompt)) return "突破策略";
+  return compactPrompt(prompt) || tr("Systematic strategy", "系统化交易策略");
+}
+
+export function getStrategyReportIdentity(run: RunData): ReportIdentity {
+  const backtest = (run.run_card?.backtest || {}) as Record<string, unknown>;
+  const symbols = (Array.isArray(backtest.codes) ? backtest.codes : run.chart_symbols || [])
+    .map(String)
+    .filter(Boolean);
+  const prompt = run.prompt || "";
+  const strategy = inferStrategyName(prompt);
+  const symbolLabel = symbols.length === 0
+    ? tr("Portfolio", "投资组合")
+    : symbols.length <= 2
+      ? symbols.join(" + ")
+      : `${symbols[0]} +${symbols.length - 1}`;
+  const fallbackRows = run.artifacts_equity_csv || [];
+  const startDate = String(backtest.start_date || (fallbackRows[0] ? timestamp(fallbackRows[0]) : ""));
+  const endDate = String(backtest.end_date || (fallbackRows.length ? timestamp(fallbackRows[fallbackRows.length - 1]) : ""));
+  return {
+    title: `${symbolLabel} · ${strategy}`,
+    strategy,
+    symbols,
+    startDate,
+    endDate,
+    source: String((run.run_card?.data_sources || [])[0] || backtest.source || ""),
+    engine: String(backtest.engine || ""),
+  };
 }
 
 function rollingSharpe(rows: Array<Record<string, string>>, window = 20): Array<number | null> {
@@ -75,6 +134,7 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
     }));
   }, [run.artifacts_equity_csv, run.equity_curve]);
   const trades = run.artifacts_trades_csv || run.trade_log || [];
+  const identity = useMemo(() => getStrategyReportIdentity(run), [run]);
 
   useEffect(() => {
     const nodes = [navRef.current, riskRef.current, tradesRef.current];
@@ -159,10 +219,23 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
 
   return (
     <article className="mx-auto max-w-[1180px] overflow-hidden border border-[#dfe2e7] bg-card shadow-sm">
-      <header className="border-b border-[#dfe2e7] bg-gradient-to-br from-[#3676df]/[0.07] to-transparent p-5 md:p-7">
-        <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-[#3676df]">{tr("Strategy backtest report", "策略回测研究报告")}</p>
-        <h2 className="mt-2 text-xl font-semibold tracking-tight">{run.prompt || run.run_id}</h2>
-        {equityRows.length > 0 && <p className="mt-2 text-sm text-muted-foreground">{timestamp(equityRows[0])} — {timestamp(equityRows[equityRows.length - 1])}</p>}
+      <header className="relative overflow-hidden border-b border-[#dfe2e7] bg-gradient-to-br from-[#3676df]/[0.10] via-background to-[#3b9b8f]/[0.05] p-5 md:p-8">
+        <div className="absolute -right-16 -top-20 h-52 w-52 rounded-full bg-[#3676df]/[0.08] blur-3xl" aria-hidden="true" />
+        <div className="relative">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-[#3676df]">{tr("Quantitative research · Backtest", "量化研究 · 策略回测")}</p>
+            <span className="rounded-full border border-[#3676df]/20 bg-background/70 px-2.5 py-1 font-mono text-[10px] text-muted-foreground">RUN {run.run_id.slice(-8).toUpperCase()}</span>
+          </div>
+          <h2 className="mt-4 max-w-4xl text-2xl font-semibold leading-tight tracking-[-0.025em] text-foreground md:text-[30px]">{identity.title}</h2>
+          {run.prompt && run.prompt !== identity.strategy && (
+            <p className="mt-2 max-w-4xl text-sm leading-6 text-muted-foreground">{compactPrompt(run.prompt)}</p>
+          )}
+          <div className="mt-5 flex flex-wrap gap-2 text-xs text-muted-foreground">
+            {(identity.startDate || identity.endDate) && <span className="inline-flex items-center gap-1.5 rounded-md border border-border/70 bg-background/65 px-2.5 py-1.5"><CalendarRange className="h-3.5 w-3.5 text-[#3676df]" />{identity.startDate || "—"} — {identity.endDate || "—"}</span>}
+            {identity.engine && <span className="inline-flex items-center gap-1.5 rounded-md border border-border/70 bg-background/65 px-2.5 py-1.5"><FlaskConical className="h-3.5 w-3.5 text-[#3676df]" />{identity.engine.toUpperCase()} {tr("engine", "回测引擎")}</span>}
+            {identity.source && <span className="inline-flex items-center gap-1.5 rounded-md border border-border/70 bg-background/65 px-2.5 py-1.5"><Database className="h-3.5 w-3.5 text-[#3676df]" />{identity.source}</span>}
+          </div>
+        </div>
       </header>
 
       <div className="grid grid-cols-2 border-b border-[#dfe2e7] md:grid-cols-3 lg:grid-cols-6">
