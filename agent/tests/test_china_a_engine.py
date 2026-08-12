@@ -105,6 +105,19 @@ class TestTPlusOne:
         bar = _make_bar(trade_date="2025-06-11")
         assert engine.can_execute("000001.SZ", 0, bar) is True
 
+    def test_sell_blocked_on_day_of_add_on_fill(self) -> None:
+        engine = _make_engine()
+        engine.positions["000001.SZ"] = Position(
+            symbol="000001.SZ",
+            direction=1,
+            entry_price=15.0,
+            entry_time=pd.Timestamp("2025-06-09"),
+            size=200.0,
+            last_increase_time=pd.Timestamp("2025-06-10 10:00"),
+        )
+        bar = _make_bar(trade_date="2025-06-10")
+        assert engine.can_execute("000001.SZ", 0, bar) is False
+
     def test_sell_allowed_when_no_position(self) -> None:
         engine = _make_engine()
         bar = _make_bar(trade_date="2025-06-10")

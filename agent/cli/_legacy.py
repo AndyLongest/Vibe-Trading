@@ -1501,6 +1501,15 @@ def cmd_run(prompt: str, max_iter: int, *, json_mode: bool = False, no_rich: boo
         _print_json_result(result)
         return _result_exit_code(result)
     _print_result(result, time.perf_counter() - start, no_rich=no_rich)
+    from cli.report_server import ensure_report_server, load_backtest_metrics
+
+    if result.get("run_id") and load_backtest_metrics(result.get("run_dir")):
+        report_url = ensure_report_server(str(result["run_id"]))
+        if report_url:
+            if no_rich:
+                print(f"Dashboard: {report_url}")
+            else:
+                console.print(f"[bold]Dashboard:[/bold] [link={report_url}]{report_url}[/link]")
     if result.get("run_id"):
         tip = f"--show {result['run_id']}  |  --continue {result['run_id']} \"...\"  |  --code {result['run_id']}  |  --pine {result['run_id']}"
         if no_rich:

@@ -575,6 +575,12 @@ export interface RunData {
   trade_markers?: TradeMarker[];
   equity_curve?: EquityPoint[];
   trade_log?: Array<Record<string, string>>;
+  artifacts_equity_csv?: Array<Record<string, string>>;
+  artifacts_metrics_csv?: Array<Record<string, string>>;
+  artifacts_trades_csv?: Array<Record<string, string>>;
+  /** Execution truth: actual post-fill weights, never optimizer targets. */
+  artifacts_positions_csv?: Array<Record<string, string>>;
+  artifacts_target_positions_csv?: Array<Record<string, string>>;
   run_logs?: Array<{ source?: string; line_number?: number; message?: string }>;
 }
 
@@ -861,6 +867,8 @@ export interface AlphaBenchRequest {
   universe: string;
   period: string;
   top?: number;
+  /** Optional factor ids; omit to evaluate the entire zoo. */
+  alpha_ids?: string[];
 }
 
 export interface AlphaBenchTopRow {
@@ -880,6 +888,20 @@ export interface AlphaBenchResult {
   top5_by_ir: AlphaBenchTopRow[];
   dead_examples: AlphaBenchTopRow[];
   by_theme: Record<string, { alive: number; reversed: number; dead: number }>;
+  n_alphas_tested?: number;
+  meta?: Record<string, unknown>;
+  rows?: AlphaBenchRow[];
+}
+
+export interface AlphaBenchRow {
+  id: string;
+  ic_mean: number;
+  ic_std: number;
+  ir: number;
+  ic_positive_ratio: number;
+  ic_count: number;
+  theme: string[];
+  category: "alive" | "reversed" | "dead";
 }
 
 export interface AlphaCompareRequest {

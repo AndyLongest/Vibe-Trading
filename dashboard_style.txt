@@ -1,0 +1,74 @@
+Vibe-Trading 因子研究 Dashboard 设计基线
+来源：本机复现任务 quantzone_group_backtest_reproduction/dashboard 的最终版本
+用途：约束因子评测结果页的信息层级、图表选择与视觉样式；不要把不存在的数据“补画”出来。
+
+一、原 Dashboard 到底有多少图表
+
+1. 真正的图表画布共 4 个：3 个折线图、1 个柱状图。
+2. 页面共有 6 个编号研究模块：前 4 个是图表，第 5 个是敏感性场景卡/表，第 6 个是方法与边界说明。
+3. 另外还有：1 张实验设定表、6 个 KPI 指标格、两组各 3 个图旁统计格，以及每次显示 3 张敏感性场景卡。
+
+二、原 Dashboard 的数据字段与画法
+
+Figure 01 累计分组收益
+- 输入字段：date、group(G0...G19)、cumulative_return。
+- 图形：多序列折线图；可在“重点组”和“全部 20 组”之间切换。
+- 编码：最佳组橙色粗线，首组/基准蓝色，其他组使用低饱和辅助色；横轴日期，纵轴累计收益。
+
+Figure 02 分组年化收益
+- 输入字段：group、annualized_return、best_group。
+- 图形：纵向柱状图。
+- 编码：最佳组橙色，普通组蓝色，负值使用更淡的蓝色；横轴 G0...G19，纵轴年化收益。
+
+Figure 03 Rank IC 稳定性
+- 输入字段：date、daily_rank_ic、rolling_20_rank_ic。
+- 图形：双折线图。
+- 编码：日频 IC 为灰色细线，20 日滚动均值为橙色粗线，保留零轴；图旁显示 IC 均值、ICIR、IC 正值比例。
+
+Figure 04 超额收益与回撤
+- 输入字段：date、cumulative_excess_return、drawdown。
+- 图形：双折线图。
+- 编码：累计超额收益为蓝色粗线，回撤为橙色线，保留零轴；图旁显示 Calmar、胜率、耗时。
+
+Figure 05 稳健性/敏感性
+- 输入字段：scenario_type、scenario_value、annualized_excess_return、best_group、sharpe、max_drawdown；分组数场景另用 first_group_return、last_group_return、head_tail_spread。
+- 图形：页签 + 三列场景卡/小表，不画虚假的连续曲线。
+- 页签：交易成本、平滑窗口、分组数量。
+
+Section 06 方法与边界
+- 输入字段：数据范围、执行假设、已知限制。
+- 图形：结构化说明卡和限制列表，不是数据图表。
+
+三、关键绘图参数
+
+- 内容最大宽度：1180px；白色论文页置于 #f3f5f8 浅灰背景。
+- 基础图尺寸：宽 960、高 280；内边距 left 58 / right 20 / top 18 / bottom 34。
+- Y 轴网格：5 个刻度；数据上下各留约 8% 空间；需要比较正负时显示零轴。
+- 颜色：主蓝 #3676df，深蓝 #2156ae，强调橙 #ff8a3d，辅助绿 #3b9b8f，正文 #191d24，次要文字 #68707c，边线 #dfe2e7，网格 #e7e9ed。
+- 字体：正文 PingFang SC / Microsoft YaHei / Inter / Arial；数值和坐标使用等宽字体。
+- 图表卡：白底、1px 浅灰边线、轻阴影或无阴影；少用大圆角，不使用霓虹色。
+- 标题：蓝色竖线作为章节标记；编号 Figure 01...06；正文保持研究报告式留白。
+- 表格：浅灰表头、细分隔线、数字右对齐并使用 tabular-nums；最佳项用橙色，风险/负值使用克制的警示色。
+- 响应式：980px 以下压缩列数；700px 以下图表与卡片改为单列或双列，表格允许横向滚动。
+
+四、迁移到 Vibe-Trading 因子评测的映射
+
+后端实际提供的逐因子字段：id、ic_mean、ic_std、ir、ic_positive_ratio、ic_count、theme、category。
+
+必须画：
+1. 因子状态 KPI：tested、alive、reversed、dead、skipped、alive ratio。
+2. IC 均值 × IR 散点图：x=ic_mean，y=ir，颜色=category，tooltip 显示 id 和统计值。
+3. 主题状态堆叠柱图：x=theme，y=因子数，stack=alive/reversed/dead。
+4. Top IR 横向排名柱图：x=IR，y=id，正向蓝色、反向橙色。
+5. 完整因子明细表：id、IC mean、IC std、IR、positive ratio、observations、theme、category。
+6. 最强与最弱因子表，以及 universe/meta 方法说明表。
+
+明确不画：
+- 当前 Alpha Bench 没有返回逐日 IC 序列，因此不画 IC 时序线。
+- 当前 Alpha Bench 没有构造分组组合和成交回测，因此不画累计收益、回撤、换手率或成本敏感性。
+- 将来只有在后端提供对应确定性数据后，才启用这些图表。
+
+交互规则：
+- 结果区提供“摘要 / 研究 Dashboard”切换；默认保留摘要，用户可主动打开 Dashboard。
+- 单因子评测通过可选 Factor IDs 限定；留空则评测整个 zoo。
+- Dashboard 中图表、表格和方法说明共享同一次评测结果，不能由 LLM 临时补值。

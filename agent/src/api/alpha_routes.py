@@ -156,6 +156,7 @@ class BenchRequest(BaseModel):
     universe: str = Field(..., min_length=1, max_length=64)
     period: str = Field(..., min_length=4, max_length=32)
     top: int = Field(20, ge=1, le=500)
+    alpha_ids: list[str] | None = Field(default=None, min_length=1, max_length=50)
 
     @field_validator("zoo")
     @classmethod
@@ -174,6 +175,19 @@ class BenchRequest(BaseModel):
                 f"unknown universe {v!r}; expected one of {sorted(_BENCH_UNIVERSES)}"
             )
         return v
+
+    @field_validator("alpha_ids")
+    @classmethod
+    def _alpha_ids_well_formed(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        unique: list[str] = []
+        for alpha_id in value:
+            if not _ALPHA_ID_RE.fullmatch(alpha_id or ""):
+                raise ValueError(f"invalid alpha id {alpha_id!r}")
+            if alpha_id not in unique:
+                unique.append(alpha_id)
+        return unique
 
 
 class CompareRequest(BaseModel):
@@ -243,7 +257,14 @@ def _make_progress_cb(
     return _cb
 
 
-def _run_bench_blocking(job_id: str, zoo: str, universe: str, period: str, top: int) -> None:
+def _run_bench_blocking(
+    job_id: str,
+    zoo: str,
+    universe: str,
+    period: str,
+    top: int,
+    alpha_ids: list[str] | None = None,
+) -> None:
     """Synchronous bench worker (called via ``asyncio.to_thread``)."""
     from src.factors.bench_runner import run_bench  # local import: heavy deps
 
@@ -259,6 +280,7 @@ def _run_bench_blocking(job_id: str, zoo: str, universe: str, period: str, top: 
             period=period,
             top=top,
             on_progress=_make_progress_cb(job_id),
+            only=alpha_ids,
         )
     except Exception as exc:  # noqa: BLE001 — worker must never crash the loop
         logger.exception("alpha bench worker crashed (job=%s)", job_id)
@@ -283,9 +305,7 @@ def _run_bench_blocking(job_id: str, zoo: str, universe: str, period: str, top: 
             # Strip the bulky per-alpha lists — the API contract returns
             # summary-only on the result event. We keep ``n_skipped`` (the
             # count) which ``_result_for_wire`` reshapes into ``skipped``.
-            slim = {
-                k: v for k, v in result.items() if k not in ("rows", "skipped")
-            }
+            slim = {k: v for k, v in result.items() if k != "skipped"}
             job["status"] = "done"
             job["result"] = slim
         job["_finished_at"] = time.time()
@@ -530,6 +550,7 @@ def register_alpha_routes(
                 "universe": payload.universe,
                 "period": payload.period,
                 "top": payload.top,
+                "alpha_ids": payload.alpha_ids,
                 "created_at": _now_iso(),
                 "progress": {"n_done": 0, "n_total": 0, "current_alpha_id": None},
                 "result": None,
@@ -546,6 +567,7 @@ def register_alpha_routes(
                         payload.universe,
                         payload.period,
                         payload.top,
+                        payload.alpha_ids,
                     )
                 except Exception:  # noqa: BLE001 — never escape the loop
                     logger.exception("bench runner outer task crashed (job=%s)", job_id)
@@ -778,6 +800,7 @@ def _result_for_wire(result: dict[str, Any]) -> dict[str, Any]:
         "by_theme",
         "n_alphas_tested",
         "meta",
+        "rows",
     )
     for k in keep:
         if k in result:
@@ -788,4 +811,18 @@ def _result_for_wire(result: dict[str, Any]) -> dict[str, Any]:
     if "n_skipped" in result:
         wire["skipped"] = result["n_skipped"]
         wire["n_skipped"] = result["n_skipped"]
+    if "rows" in wire:
+        wire["rows"] = [
+            {
+                "id": row.get("id"),
+                "ic_mean": row.get("ic_mean"),
+                "ic_std": row.get("ic_std"),
+                "ir": row.get("ir"),
+                "ic_positive_ratio": row.get("ic_positive_ratio"),
+                "ic_count": row.get("ic_count"),
+                "theme": row.get("theme", []),
+                "category": row.get("_category", row.get("category", "dead")),
+            }
+            for row in wire["rows"]
+        ]
     return wire

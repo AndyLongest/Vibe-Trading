@@ -18,6 +18,7 @@ import copy
 import json
 import logging
 import queue
+import shutil
 import sys
 import threading
 import time as _time
@@ -497,6 +498,52 @@ def _normalize_tool_run_dir(args: dict[str, Any], memory_run_dir: str | None) ->
     if not candidate.is_absolute():
         normalized["run_dir"] = str((Path(memory_run_dir) / candidate).resolve())
     return normalized
+
+
+def _archive_backtest_result(result: str, active_run_dir: str | None) -> bool:
+    """Copy a successful detached backtest into the active, reportable run.
+
+    The model may choose another allowed run directory while iterating.  The
+    CLI and web API, however, identify the turn by ``active_run_dir``.  Keep
+    that public identity stable by copying only deterministic backtest output
+    into the active run as soon as the backtest tool succeeds.
+    """
+    if not active_run_dir:
+        return False
+    try:
+        payload = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    source_value = payload.get("run_dir")
+    if not source_value:
+        return False
+    source = Path(str(source_value)).resolve()
+    target = Path(active_run_dir).resolve()
+    if source == target or not (source / "artifacts" / "metrics.csv").is_file():
+        return False
+
+    target.mkdir(parents=True, exist_ok=True)
+    for directory in ("artifacts", "code", "logs"):
+        source_dir = source / directory
+        if source_dir.is_dir():
+            shutil.copytree(source_dir, target / directory, dirs_exist_ok=True)
+    for filename in (
+        "config.json",
+        "design_spec.json",
+        "planner_output.json",
+        "rag_metadata.json",
+        "review_report.json",
+        "run_card.json",
+        "run_card.md",
+        "llm_usage.json",
+    ):
+        source_file = source / filename
+        if source_file.is_file():
+            shutil.copy2(source_file, target / filename)
+    return (target / "artifacts" / "metrics.csv").is_file()
 
 
 class AgentLoop:
@@ -1686,6 +1733,11 @@ class AgentLoop:
         success = _is_tool_success(result)
         if success:
             self._called_ok.add(tc.name)
+            if tc.name == "backtest":
+                try:
+                    _archive_backtest_result(result, self.memory.run_dir)
+                except OSError as exc:
+                    logger.warning("Could not archive backtest output into active run: %s", exc)
 
         if self._grounding is not None:
             self._grounding.ingest_tool_result(

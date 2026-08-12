@@ -15,6 +15,9 @@ vi.mock("@/components/charts/CandlestickChart", () => ({
 vi.mock("@/components/charts/EquityChart", () => ({
   EquityChart: () => <div data-testid="equity-chart" />,
 }));
+vi.mock("@/components/charts/StrategyResearchDashboard", () => ({
+  StrategyResearchDashboard: ({ run }: { run: RunData }) => <div data-testid="strategy-dashboard">{run.run_id}</div>,
+}));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -37,6 +40,16 @@ describe("RunDetail page", () => {
   beforeEach(() => {
     apiMock.getRun.mockReset();
     apiMock.getRunCode.mockReset();
+  });
+
+  it("opens the research dashboard when requested by the terminal report URL", async () => {
+    apiMock.getRun.mockResolvedValue({ status: "success", run_id: "terminal-run", prompt: "MA strategy" });
+    apiMock.getRunCode.mockResolvedValue({});
+
+    renderRunDetail("/runs/terminal-run?view=dashboard");
+
+    expect(await screen.findByTestId("strategy-dashboard")).toHaveTextContent("terminal-run");
+    expect(screen.getByRole("tab", { name: /dashboard/i })).toHaveAttribute("aria-selected", "true");
   });
 
   it("does not let an older route load replace the current run or code", async () => {

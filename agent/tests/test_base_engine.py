@@ -33,6 +33,106 @@ class _LifecycleEngine(ChinaAEngine):
         super()._execute_open_order(order, ts)
 
 
+class _FractionalEngine(BaseEngine):
+    """Frictionless engine used to expose target-vs-execution differences."""
+
+    def __init__(self, *, block_adds_after_first: bool = False):
+        super().__init__({"initial_cash": 1_000.0})
+        self.block_adds_after_first = block_adds_after_first
+
+    def can_execute(self, symbol, direction, bar):
+        if (
+            self.block_adds_after_first
+            and direction != 0
+            and symbol in self.positions
+        ):
+            return False
+        return True
+
+    def round_size(self, raw_size, price):
+        return raw_size
+
+    def calc_commission(self, size, price, direction, is_open):
+        return 0.0
+
+    def apply_slippage(self, price, direction):
+        return price
+
+
+def _fractional_fixture(weights: list[float]):
+    dates = pd.bdate_range("2026-01-05", periods=len(weights))
+    bars = pd.DataFrame(
+        {"open": [100.0] * len(dates), "close": [100.0] * len(dates)},
+        index=dates,
+    )
+    close_df = pd.DataFrame({"AAPL.US": bars["close"]}, index=dates)
+    targets = pd.DataFrame({"AAPL.US": weights}, index=dates)
+    return dates, bars, close_df, targets
+
+
+def test_same_direction_target_change_resizes_actual_position() -> None:
+    dates, bars, close_df, targets = _fractional_fixture([0.2, 0.8, 0.8])
+    engine = _FractionalEngine()
+
+    engine._execute_bars(
+        dates, {"AAPL.US": bars}, close_df, targets, ["AAPL.US"]
+    )
+
+    actual = engine._actual_positions_frame(["AAPL.US"])
+    assert actual.loc[dates[0], "AAPL.US"] == pytest.approx(0.2)
+    assert actual.loc[dates[1], "AAPL.US"] == pytest.approx(0.8)
+    # The terminal liquidation closes the full resized position, proving the
+    # engine held 8 shares rather than retaining the original 2 shares.
+    assert engine.trades[-1].size == pytest.approx(8.0)
+
+
+def test_same_direction_target_reduction_partially_closes() -> None:
+    dates, bars, close_df, targets = _fractional_fixture([0.8, 0.2, 0.2])
+    engine = _FractionalEngine()
+
+    engine._execute_bars(
+        dates, {"AAPL.US": bars}, close_df, targets, ["AAPL.US"]
+    )
+
+    actual = engine._actual_positions_frame(["AAPL.US"])
+    assert actual.loc[dates[1], "AAPL.US"] == pytest.approx(0.2)
+    assert engine.trades[0].exit_reason == "rebalance"
+    assert engine.trades[0].size == pytest.approx(6.0)
+    assert engine.trades[-1].size == pytest.approx(2.0)
+
+
+def test_positions_artifact_reports_fills_not_blocked_targets(tmp_path) -> None:
+    dates, bars, close_df, targets = _fractional_fixture([0.2, 0.8, 0.8])
+    engine = _FractionalEngine(block_adds_after_first=True)
+    engine._execute_bars(
+        dates, {"AAPL.US": bars}, close_df, targets, ["AAPL.US"]
+    )
+    equity = pd.Series(
+        [snapshot.equity for snapshot in engine.equity_snapshots], index=dates
+    )
+    benchmark_return = pd.Series(0.0, index=dates)
+    benchmark_equity = pd.Series(1_000.0, index=dates)
+
+    engine._write_artifacts(
+        tmp_path,
+        {"AAPL.US": bars},
+        dates,
+        equity,
+        benchmark_equity,
+        benchmark_return,
+        targets,
+        {},
+        ["AAPL.US"],
+    )
+
+    actual_csv = pd.read_csv(tmp_path / "artifacts" / "positions.csv", index_col=0)
+    target_csv = pd.read_csv(
+        tmp_path / "artifacts" / "target_positions.csv", index_col=0
+    )
+    assert actual_csv.iloc[1]["AAPL.US"] == pytest.approx(0.2)
+    assert target_csv.iloc[1]["AAPL.US"] == pytest.approx(0.8)
+
+
 def _run_lifecycle(engine: _LifecycleEngine) -> None:
     dates = pd.DatetimeIndex([pd.Timestamp("2026-01-02")])
     frame = pd.DataFrame({"open": [100.0], "close": [100.0]}, index=dates)

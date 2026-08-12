@@ -395,6 +395,59 @@ class CryptoEngine(BaseEngine):
         if self.perpetual_strict and self.margin_mode == "isolated":
             self._isolated_margins[order.symbol] = order.margin
 
+    def _after_position_increase(self, order, timestamp: pd.Timestamp) -> None:
+        """Keep strict perpetual evidence and isolated margin in sync on adds."""
+        if self.perpetual_strict:
+            self._record_event(
+                timestamp,
+                "market_fill",
+                action="open",
+                symbol=order.symbol,
+                side="buy" if order.direction == 1 else "sell",
+                signed_quantity=order.direction * order.size,
+                execution_price=order.price,
+                execution_price_source="execution_open",
+                trading_fee=order.commission,
+                reason="rebalance",
+            )
+        if self.perpetual_strict and self.margin_mode == "isolated":
+            pos = self.positions[order.symbol]
+            self._isolated_margins[order.symbol] = self._calc_margin(
+                order.symbol, pos.size, pos.entry_price, pos.leverage
+            )
+
+    def _after_position_reduction(
+        self,
+        symbol: str,
+        size: float,
+        exit_price: float,
+        exit_time: pd.Timestamp,
+        reason: str,
+    ) -> None:
+        """Keep strict perpetual evidence and isolated margin in sync on trims."""
+        if self.perpetual_strict:
+            trade = self.trades[-1]
+            exit_fee = self.calc_commission(
+                size, exit_price, trade.direction, is_open=False
+            )
+            self._record_event(
+                exit_time,
+                "market_fill",
+                action="close",
+                symbol=symbol,
+                side="sell" if trade.direction == 1 else "buy",
+                signed_quantity=-trade.direction * size,
+                execution_price=exit_price,
+                execution_price_source="execution_open",
+                trading_fee=exit_fee,
+                reason=reason,
+            )
+        if self.perpetual_strict and self.margin_mode == "isolated":
+            pos = self.positions[symbol]
+            self._isolated_margins[symbol] = self._calc_margin(
+                symbol, pos.size, pos.entry_price, pos.leverage
+            )
+
     def _close_position(
         self,
         symbol: str,

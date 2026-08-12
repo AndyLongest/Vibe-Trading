@@ -366,4 +366,7 @@ def test_run_backtest_emits_risk_xray_artifacts(tmp_path):
     assert metrics["risk_xray_hhi"] == pytest.approx(0.5)
     assert metrics["risk_xray_effective_n"] == pytest.approx(2.0)
     assert metrics["risk_xray_annualized_vol"] is not None
-    assert metrics["risk_xray_avg_invested"] == pytest.approx(39 / 40, abs=1e-6)
+    # Execution truth has two flat observations: the initial next-bar-open
+    # signal lag and the terminal liquidation.  The old target-frame report
+    # counted the latter as invested even though the position was closed.
+    assert metrics["risk_xray_avg_invested"] == pytest.approx(38 / 40, abs=1e-6)

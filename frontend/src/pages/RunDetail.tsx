@@ -2,7 +2,7 @@ import i18n from '@/i18n';
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { useParams, useNavigate } from "react-router";
+import { useParams, useNavigate, useSearchParams } from "react-router";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -15,6 +15,7 @@ import {
   FileCheck2,
   Fingerprint,
   List,
+  LayoutDashboard,
   Loader2,
   ShieldCheck,
   XCircle,
@@ -31,10 +32,11 @@ import { MetricsCard } from "@/components/chat/MetricsCard";
 import { ValidationPanel } from "@/components/charts/ValidationPanel";
 import { Skeleton, SkeletonMetrics, SkeletonChart } from "@/components/common/Skeleton";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
+import { StrategyResearchDashboard } from "@/components/charts/StrategyResearchDashboard";
 
 const rehypePlugins = [rehypeHighlight];
 
-type Tab = "chart" | "trades" | "runCard" | "code" | "validation";
+type Tab = "dashboard" | "chart" | "trades" | "runCard" | "code" | "validation";
 type ChartPayload = Pick<RunData, "price_series" | "indicator_series" | "trade_markers">;
 type ChartCache = Record<string, ChartPayload>;
 type ChartLoadProgress = { done: number; total: number };
@@ -96,11 +98,13 @@ function yieldToBrowser(): Promise<void> {
 
 export function RunDetail() {
   const { runId } = useParams<{ runId: string }>();
+  const [searchParams] = useSearchParams();
+  const requestedInitialTab: Tab = searchParams.get("view") === "dashboard" ? "dashboard" : "chart";
   const navigate = useNavigate();
   const { t } = useTranslation();
   const [run, setRun] = useState<RunData | null>(null);
   const [code, setCode] = useState<Record<string, string>>({});
-  const [tab, setTab] = useState<Tab>("chart");
+  const [tab, setTab] = useState<Tab>(requestedInitialTab);
   const [loading, setLoading] = useState(true);
   const [selectedSymbol, setSelectedSymbol] = useState("");
   const [chartPickerSymbol, setChartPickerSymbol] = useState("");
@@ -116,6 +120,7 @@ export function RunDetail() {
   const hasValidation = !!run?.validation;
   const hasRunCard = !!run?.run_card;
   const TABS: { id: Tab; label: string; icon: typeof BarChart3; hidden?: boolean }[] = [
+    { id: "dashboard", label: i18n.language.toLowerCase().startsWith("zh") ? "研究 Dashboard" : "Research dashboard", icon: LayoutDashboard },
     { id: "chart", label: i18n.t("runDetail.chart"), icon: BarChart3 },
     { id: "trades", label: i18n.t("runDetail.trades"), icon: List },
     { id: "validation", label: i18n.t("runDetail.validation"), icon: ShieldCheck, hidden: !hasValidation },
@@ -128,7 +133,7 @@ export function RunDetail() {
     cancelBulkChartLoadRef.current = true;
     setRun(null);
     setCode({});
-    setTab("chart");
+    setTab(requestedInitialTab);
     setLoading(true);
     setSelectedSymbol("");
     setChartPickerSymbol("");
@@ -170,7 +175,7 @@ export function RunDetail() {
       cancelBulkChartLoadRef.current = true;
       if (runGenerationRef.current === generation) runGenerationRef.current += 1;
     };
-  }, [runId]);
+  }, [runId, requestedInitialTab]);
 
   if (loading) {
     return (
@@ -363,6 +368,7 @@ export function RunDetail() {
 
       <div className="flex-1 overflow-auto">
         <ErrorBoundary>
+          {tab === "dashboard" && <div className="p-4"><StrategyResearchDashboard run={run} /></div>}
           {tab === "chart" && (
             <ChartTab
               run={run}

@@ -60,6 +60,7 @@ class RunResponse(BaseModel):
     run_id: str = Field(..., description="Run identifier")
     elapsed_seconds: float = Field(..., description="Execution time in seconds")
     reason: Optional[str] = Field(None, description="Failure reason when available")
+    prompt: Optional[str] = Field(None, description="Original natural-language request")
 
     planner_output: Optional[Dict[str, Any]] = Field(None, description="Planner output")
     strategy_spec: Optional[Dict[str, Any]] = Field(None, description="Strategy specification")
@@ -76,6 +77,12 @@ class RunResponse(BaseModel):
     artifacts_equity_csv: Optional[List[Dict[str, Any]]] = Field(None, description="Full equity rows")
     artifacts_metrics_csv: Optional[List[Dict[str, Any]]] = Field(None, description="Full metrics rows")
     artifacts_trades_csv: Optional[List[Dict[str, Any]]] = Field(None, description="Full trade rows")
+    artifacts_positions_csv: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Actual post-execution position weights"
+    )
+    artifacts_target_positions_csv: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Optimizer-requested target weights"
+    )
     validation: Optional[Dict[str, Any]] = Field(None, description="Statistical validation results")
 
     run_directory: str = Field(..., description="Run directory path")

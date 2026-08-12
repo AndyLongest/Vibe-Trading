@@ -19,6 +19,7 @@ from src.agent.loop import (
     _fix_tool_pairs,
     _is_tool_success,
     _normalize_tool_run_dir,
+    _archive_backtest_result,
 )
 
 
@@ -327,3 +328,39 @@ class TestNormalizeToolRunDir:
         args = {"run_dir": absolute_run_dir}
         out = _normalize_tool_run_dir(args, "/tmp/run_123")
         assert out["run_dir"] == absolute_run_dir
+
+
+class TestArchiveBacktestResult:
+    def test_copies_detached_backtest_into_active_run(self, tmp_path: Path) -> None:
+        source = tmp_path / "detached"
+        active = tmp_path / "active"
+        (source / "artifacts").mkdir(parents=True)
+        (source / "code").mkdir()
+        (source / "artifacts" / "metrics.csv").write_text(
+            "total_return,sharpe\n0.12,1.1\n", encoding="utf-8"
+        )
+        (source / "artifacts" / "equity.csv").write_text(
+            "timestamp,equity\n2026-01-01,1\n", encoding="utf-8"
+        )
+        (source / "code" / "signal_engine.py").write_text("pass\n", encoding="utf-8")
+        (source / "config.json").write_text("{}\n", encoding="utf-8")
+
+        archived = _archive_backtest_result(
+            json.dumps({"status": "ok", "run_dir": str(source)}), str(active)
+        )
+
+        assert archived is True
+        assert (active / "artifacts" / "metrics.csv").is_file()
+        assert (active / "artifacts" / "equity.csv").is_file()
+        assert (active / "code" / "signal_engine.py").is_file()
+        assert (active / "config.json").is_file()
+
+    def test_ignores_result_without_metrics(self, tmp_path: Path) -> None:
+        source = tmp_path / "not-a-backtest"
+        source.mkdir()
+
+        archived = _archive_backtest_result(
+            json.dumps({"status": "ok", "run_dir": str(source)}), str(tmp_path / "active")
+        )
+
+        assert archived is False

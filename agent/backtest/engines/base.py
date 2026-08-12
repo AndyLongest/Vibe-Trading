@@ -391,6 +391,11 @@ class BaseEngine(ABC):
         self.positions: Dict[str, Position] = {}
         self.trades: List[TradeRecord] = []
         self.equity_snapshots: List[EquitySnapshot] = []
+        # Per-bar, post-fill portfolio weights.  These are deliberately kept
+        # separate from ``target_pos``: market rules, lot rounding, fees, and
+        # insufficient cash can all make the executed book differ from the
+        # optimiser's request.
+        self.actual_position_snapshots: List[tuple[pd.Timestamp, Dict[str, float]]] = []
         self._bar_idx: int = 0
         self._active_symbol: str = ""  # set by _rebalance/_close_position for subclass use
 
@@ -683,6 +688,7 @@ class BaseEngine(ABC):
 
         # 4. Bar-by-bar execution
         self._execute_bars(dates, data_map, close_df, target_pos, valid_codes)
+        actual_pos = self._actual_positions_frame(valid_codes)
 
         # 5. Build output series
         equity_series = pd.Series(
@@ -727,7 +733,7 @@ class BaseEngine(ABC):
             self.initial_capital,
             bars_per_year,
             bench_ret,
-            target_pos,
+            actual_pos,
             turnover_series=realized_turnover,
         )
         m.update(benchmark_metadata)
@@ -760,7 +766,7 @@ class BaseEngine(ABC):
             write_risk_xray,
         )
         try:
-            basket_weights, avg_invested = average_invested_weights(target_pos)
+            basket_weights, avg_invested = average_invested_weights(actual_pos)
             risk_xray = compute_risk_xray(
                 close_df, basket_weights, periods_per_year=bars_per_year,
             )
@@ -834,6 +840,7 @@ class BaseEngine(ABC):
         # Store as instance attrs for use in _calc_equity / _safe_price
         self._close_arr = _close_arr
         self._code_to_col = _code_to_col
+        self.actual_position_snapshots = []
 
         for i, ts in enumerate(dates):
             self._bar_idx = i
@@ -855,7 +862,8 @@ class BaseEngine(ABC):
                     target_weights[c] = None
                     logger.warning("Target weight failed for %s at %s: %s", c, ts, exc)
 
-            # b. Release capital before opening replacement positions.  A
+            # b. Release capital before opening replacement positions or
+            # increasing other positions.  A
             # single mixed close/open pass makes rotations depend on symbol
             # iteration order when the new name is visited before the old one.
             for c in codes:
@@ -871,6 +879,23 @@ class BaseEngine(ABC):
                         logger.warning(
                             "Rebalance close failed for %s at %s: %s", c, ts, exc
                         )
+
+            # Same-direction reductions must also happen before additions so
+            # that their released margin is available to the whole basket.
+            for c in codes:
+                target_w = target_weights[c]
+                current_pos = self.positions.get(c)
+                if target_w is None or current_pos is None:
+                    continue
+                target_dir = 1 if target_w > 1e-9 else (-1 if target_w < -1e-9 else 0)
+                if target_dir != current_pos.direction:
+                    continue
+                try:
+                    self._reduce_to_target(c, target_w, data_map.get(c), ts, equity)
+                except Exception as exc:
+                    logger.warning(
+                        "Rebalance reduction failed for %s at %s: %s", c, ts, exc
+                    )
 
             # c. Price every opening order before committing any of them.  If
             # the requested basket does not fit after fees/lot rounding, apply
@@ -888,15 +913,16 @@ class BaseEngine(ABC):
                     target_dir == 0 or target_dir != current_pos.direction
                 ):
                     continue
-                if current_pos is None and target_dir != 0:
+                if target_dir != 0:
                     open_targets.append((c, target_w, data_map.get(c)))
 
             def _plans(scale: float) -> list[_OpenOrder]:
                 result: list[_OpenOrder] = []
                 for c, target_w, frame in open_targets:
                     try:
-                        order = self._plan_open_order(
-                            c, target_w * scale, frame, ts, equity
+                        order = self._plan_increase_order(
+                            c, target_w, frame, ts, equity,
+                            increase_scale=scale,
                         )
                     except Exception as exc:
                         logger.warning(
@@ -922,7 +948,7 @@ class BaseEngine(ABC):
                         high = mid
 
             for order in planned:
-                self._execute_open_order(order, ts)
+                self._execute_increase_order(order, ts)
 
             # d. Apply post-execution hooks after all normal market fills.
             if not stop_run:
@@ -930,6 +956,9 @@ class BaseEngine(ABC):
 
             # e. Record equity snapshot
             snap_equity = self._calc_equity(close_df, ts)
+            self.actual_position_snapshots.append(
+                (ts, self._actual_weights(close_df, ts, codes, snap_equity))
+            )
             if self.positions and type(self)._calc_pnl is BaseEngine._calc_pnl:
                 _syms = list(self.positions.keys())
                 _eps = np.array([p.entry_price for p in self.positions.values()])
@@ -986,6 +1015,10 @@ class BaseEngine(ABC):
                     unrealized=0.0,
                     equity=self.capital,
                     positions=0,
+                )
+            if self.actual_position_snapshots:
+                self.actual_position_snapshots[-1] = (
+                    last_ts, {code: 0.0 for code in codes}
                 )
 
         # Clean up temporary instance attributes
@@ -1117,6 +1150,121 @@ class BaseEngine(ABC):
             if order is not None and order.cost <= self.capital + 1e-9:
                 self._execute_open_order(order, ts)
 
+    def _target_size(
+        self,
+        symbol: str,
+        target_weight: float,
+        equity: float,
+        price: float,
+        leverage: float,
+    ) -> float:
+        """Convert one requested portfolio weight into an executable size."""
+        target_notional = abs(target_weight) * equity * leverage
+        return self.round_size(
+            self._calc_raw_size(symbol, target_notional, price), price
+        )
+
+    def _reduce_to_target(
+        self,
+        symbol: str,
+        target_weight: float,
+        df: Optional[pd.DataFrame],
+        ts: pd.Timestamp,
+        equity: float,
+    ) -> None:
+        """Partially close a same-direction position when its target shrinks."""
+        self._active_symbol = symbol
+        pos = self.positions.get(symbol)
+        if pos is None or df is None or ts not in df.index:
+            return
+        bar = df.loc[ts]
+        raw_price = self.execution_open(bar)
+        if raw_price == 0 or (raw_price < 0 and not self.allow_nonpositive_prices):
+            return
+
+        # First compare at the observable open.  Only ask the market-rule layer
+        # for a sell/cover when a reduction is actually required.
+        desired = self._target_size(
+            symbol, target_weight, equity, raw_price, pos.leverage
+        )
+        if desired >= pos.size - 1e-9:
+            return
+        if not self.can_execute(symbol, 0, bar):
+            return
+
+        exit_price = self.apply_slippage(raw_price, -pos.direction)
+        desired = self._target_size(
+            symbol, target_weight, equity, exit_price, pos.leverage
+        )
+        reduce_size = min(max(pos.size - desired, 0.0), pos.size)
+        if reduce_size <= 1e-9:
+            return
+        if reduce_size >= pos.size - 1e-9:
+            self._close_position(symbol, exit_price, ts, "rebalance")
+            return
+        self._partially_close_position(
+            symbol, reduce_size, exit_price, ts, "rebalance"
+        )
+
+    def _plan_increase_order(
+        self,
+        symbol: str,
+        target_weight: float,
+        df: Optional[pd.DataFrame],
+        ts: pd.Timestamp,
+        equity: float,
+        *,
+        increase_scale: float = 1.0,
+    ) -> Optional[_OpenOrder]:
+        """Price only the incremental fill needed to reach a target weight."""
+        self._active_symbol = symbol
+        direction = 1 if target_weight > 1e-9 else (-1 if target_weight < -1e-9 else 0)
+        current = self.positions.get(symbol)
+        if (
+            direction == 0
+            or (current is not None and current.direction != direction)
+            or df is None
+            or ts not in df.index
+        ):
+            return None
+        # Preserve the established opening-order boundary for brand-new
+        # positions (including subclass overrides and fault isolation tests).
+        if current is None:
+            return self._plan_open_order(
+                symbol, target_weight * increase_scale, df, ts, equity
+            )
+        bar = df.loc[ts]
+        if not self.can_execute(symbol, direction, bar):
+            return None
+        raw_price = self.execution_open(bar)
+        if raw_price == 0 or (raw_price < 0 and not self.allow_nonpositive_prices):
+            return None
+        price = self.apply_slippage(raw_price, direction)
+        leverage = current.leverage if current is not None else self._leverage_for_symbol(symbol)
+        desired_size = self._target_size(
+            symbol, target_weight, equity, price, leverage
+        )
+        current_size = current.size if current is not None else 0.0
+        full_add_size = desired_size - current_size
+        if full_add_size <= 1e-9:
+            return None
+        add_size = self.round_size(full_add_size * increase_scale, price)
+        if add_size <= 1e-9:
+            return None
+        margin = self._calc_margin(symbol, add_size, price, leverage)
+        commission = self.calc_commission(
+            add_size, price, direction, is_open=True
+        )
+        return _OpenOrder(
+            symbol=symbol,
+            direction=direction,
+            price=price,
+            size=add_size,
+            leverage=leverage,
+            margin=margin,
+            commission=commission,
+        )
+
     def _plan_open_order(
         self,
         symbol: str,
@@ -1177,7 +1325,153 @@ class BaseEngine(ABC):
             leverage=order.leverage,
             entry_bar_idx=self._bar_idx,
             entry_commission=order.commission,
+            last_increase_time=ts,
         )
+
+    def _execute_increase_order(self, order: _OpenOrder, ts: pd.Timestamp) -> None:
+        """Commit a new position or add a delta fill to an existing one."""
+        current = self.positions.get(order.symbol)
+        if current is None:
+            self._execute_open_order(order, ts)
+            return
+        if current.direction != order.direction:
+            raise RuntimeError("cannot increase a position in the opposite direction")
+        if order.cost > self.capital + 1e-7:
+            raise RuntimeError(
+                f"planned increase for {order.symbol} exceeds available capital"
+            )
+        self.capital -= order.cost
+        total_size = current.size + order.size
+        avg_entry = (
+            current.entry_price * current.size + order.price * order.size
+        ) / total_size
+        self.positions[order.symbol] = Position(
+            symbol=order.symbol,
+            direction=current.direction,
+            entry_price=avg_entry,
+            entry_time=current.entry_time,
+            size=total_size,
+            leverage=current.leverage,
+            entry_bar_idx=current.entry_bar_idx,
+            entry_commission=current.entry_commission + order.commission,
+            last_increase_time=ts,
+        )
+        self._after_position_increase(order, ts)
+
+    def _after_position_increase(self, order: _OpenOrder, ts: pd.Timestamp) -> None:
+        """Subclass hook for evidence or margin state after an add-on fill."""
+
+    def _partially_close_position(
+        self,
+        symbol: str,
+        size: float,
+        exit_price: float,
+        exit_time: pd.Timestamp,
+        reason: str,
+    ) -> None:
+        """Close part of a position and retain the remainder in-place."""
+        self._active_symbol = symbol
+        pos = self.positions.get(symbol)
+        if pos is None or size <= 0 or size >= pos.size:
+            raise ValueError("partial close size must be between zero and position size")
+
+        fraction = size / pos.size
+        entry_commission = pos.entry_commission * fraction
+        exit_commission = self.calc_commission(
+            size, exit_price, pos.direction, is_open=False
+        )
+        pnl = self._calc_pnl(
+            symbol, pos.direction, size, pos.entry_price, exit_price
+        )
+        margin = self._calc_margin(
+            symbol, size, pos.entry_price, pos.leverage
+        )
+        exit_margin = self._calc_margin(
+            symbol, size, exit_price, pos.leverage
+        )
+        self.capital += margin + pnl - exit_commission
+
+        remaining_size = pos.size - size
+        self.positions[symbol] = Position(
+            symbol=symbol,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            entry_time=pos.entry_time,
+            size=remaining_size,
+            leverage=pos.leverage,
+            entry_bar_idx=pos.entry_bar_idx,
+            entry_commission=pos.entry_commission - entry_commission,
+            last_increase_time=pos.last_increase_time,
+        )
+        holding_bars = max(self._bar_idx - pos.entry_bar_idx, 0)
+        self.trades.append(TradeRecord(
+            symbol=symbol,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            entry_time=pos.entry_time,
+            exit_time=exit_time,
+            size=size,
+            leverage=pos.leverage,
+            pnl=pnl,
+            pnl_pct=pnl / margin * 100 if margin > 1e-9 else 0.0,
+            exit_reason=reason,
+            holding_bars=holding_bars,
+            commission=entry_commission + exit_commission,
+            entry_margin=margin,
+            exit_margin=exit_margin,
+        ))
+        self._after_position_reduction(symbol, size, exit_price, exit_time, reason)
+
+    def _after_position_reduction(
+        self,
+        symbol: str,
+        size: float,
+        exit_price: float,
+        exit_time: pd.Timestamp,
+        reason: str,
+    ) -> None:
+        """Subclass hook for evidence or margin state after a partial close."""
+
+    def _actual_weights(
+        self,
+        close_df: pd.DataFrame,
+        ts: pd.Timestamp,
+        codes: List[str],
+        equity: float,
+    ) -> Dict[str, float]:
+        """Return post-fill, mark-to-market weights for the currently held book."""
+        weights = {code: 0.0 for code in codes}
+        if abs(equity) <= 1e-12:
+            return weights
+        for symbol, pos in self.positions.items():
+            price = self._safe_price(
+                close_df,
+                ts,
+                symbol,
+                pos.entry_price,
+                _arr=getattr(self, "_close_arr", None),
+                _row=getattr(self, "_bar_idx", None),
+                _col=getattr(self, "_code_to_col", {}).get(symbol),
+            )
+            margin_value = self._calc_margin(
+                symbol, pos.size, price, pos.leverage
+            )
+            weights[symbol] = pos.direction * margin_value / equity
+        return weights
+
+    def _actual_positions_frame(self, codes: List[str]) -> pd.DataFrame:
+        """Materialize recorded post-fill weights as an artifact-ready frame."""
+        if not self.actual_position_snapshots:
+            return pd.DataFrame(columns=codes, dtype=float)
+        frame = pd.DataFrame(
+            [weights for _, weights in self.actual_position_snapshots],
+            index=[timestamp for timestamp, _ in self.actual_position_snapshots],
+            columns=codes,
+            dtype=float,
+        )
+        frame.index.name = "timestamp"
+        return frame
 
     def _close_position(
         self,
@@ -1256,9 +1550,13 @@ class BaseEngine(ABC):
         eq_df.index.name = "timestamp"
         eq_df.to_csv(out / "equity.csv")
 
-        # Position weights (target, for compatibility)
-        target_pos.index.name = "timestamp"
-        target_pos.to_csv(out / "positions.csv")
+        # ``positions.csv`` is execution truth.  Keep optimiser requests in a
+        # separate artifact so blocked/rounded/scaled fills remain auditable.
+        actual_pos = self._actual_positions_frame(codes)
+        actual_pos.to_csv(out / "positions.csv")
+        target_out = target_pos.copy()
+        target_out.index.name = "timestamp"
+        target_out.to_csv(out / "target_positions.csv")
 
         # Trades (compatible format)
         trade_rows = []

@@ -27,6 +27,8 @@ import {
   AlertTriangle,
   XCircle,
   Library,
+  LayoutDashboard,
+  List,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -41,6 +43,7 @@ import {
 import { echarts } from "@/lib/echarts";
 import { getChartTheme } from "@/lib/chart-theme";
 import { useThemeDark } from "@/lib/theme-store";
+import { FactorResearchDashboard } from "@/components/charts/FactorResearchDashboard";
 
 /* ---------- Constants ---------- */
 
@@ -534,8 +537,8 @@ function DetailView({ alphaId }: DetailProps) {
   // Keep period in sync with the BenchView form default so the prefilled
   // form values match what users see if they click "Run bench" from here.
   const benchHref = benchUniverse
-    ? `/alpha-zoo/bench?zoo=${encodeURIComponent(a.zoo)}&universe=${encodeURIComponent(benchUniverse)}&period=2020-2025`
-    : `/alpha-zoo/bench?zoo=${encodeURIComponent(a.zoo)}&period=2020-2025`;
+    ? `/alpha-zoo/bench?zoo=${encodeURIComponent(a.zoo)}&universe=${encodeURIComponent(benchUniverse)}&period=2020-2025&alpha=${encodeURIComponent(a.id)}`
+    : `/alpha-zoo/bench?zoo=${encodeURIComponent(a.zoo)}&period=2020-2025&alpha=${encodeURIComponent(a.id)}`;
 
   return (
     <div className="p-4 md:p-8 max-w-4xl mx-auto space-y-6">
@@ -660,6 +663,7 @@ function BenchView() {
       universe: q.get("universe") || "csi300",
       period: q.get("period") || "2020-2025",
       top: Number(q.get("top") || "20"),
+      alphaIds: q.get("alpha") || "",
     };
   }, [locSearch]);
 
@@ -667,11 +671,18 @@ function BenchView() {
   const [universe, setUniverse] = useState(initial.universe);
   const [period, setPeriod] = useState(initial.period);
   const [top, setTop] = useState<number>(initial.top);
+  const [alphaIdsText, setAlphaIdsText] = useState(initial.alphaIds);
 
   const [status, setStatus] = useState<BenchStatus>("idle");
   const [jobId, setJobId] = useState<string | null>(null);
   const [progress, setProgress] = useState<BenchProgress | null>(null);
   const [result, setResult] = useState<AlphaBenchResult | null>(null);
+  const [resultContext, setResultContext] = useState({
+    zoo: initial.zoo,
+    universe: initial.universe,
+    period: initial.period,
+    alphaIds: parseAlphaIds(initial.alphaIds),
+  });
   const [formError, setFormError] = useState<string | null>(null);
   const sourceRef = useRef<EventSource | null>(null);
   // Track terminal `done` so the synthetic EventSource `error` fired on
@@ -695,12 +706,15 @@ function BenchView() {
     doneRef.current = false;
     sourceRef.current?.close();
     const safeTop = Number.isFinite(top) && top > 0 ? top : 20;
+    const selectedAlphaIds = parseAlphaIds(alphaIdsText);
+    setResultContext({ zoo, universe, period, alphaIds: selectedAlphaIds });
     try {
       const res = await api.createAlphaBench({
         zoo,
         universe,
         period,
         top: safeTop,
+        ...(selectedAlphaIds.length ? { alpha_ids: selectedAlphaIds } : {}),
       });
       setJobId(res.job_id);
       await attachStream(res.job_id);
@@ -778,7 +792,7 @@ function BenchView() {
   const busy = status === "submitting" || status === "streaming";
 
   return (
-    <div className="p-4 md:p-8 max-w-5xl mx-auto space-y-6">
+    <div className="p-4 md:p-8 max-w-[1180px] mx-auto space-y-6">
       <Link
         to="/alpha-zoo"
         className="text-sm text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
@@ -801,7 +815,7 @@ function BenchView() {
       {/* Form */}
       <form
         onSubmit={startBench}
-        className="grid grid-cols-1 items-end gap-3 rounded-xl border border-border/60 bg-card p-4 shadow-sm sm:grid-cols-2 lg:grid-cols-5"
+        className="grid grid-cols-1 items-end gap-3 rounded-xl border border-border/60 bg-card p-4 shadow-sm sm:grid-cols-2 lg:grid-cols-6"
       >
         <div>
           <label htmlFor="bench-zoo" className="text-xs text-muted-foreground block mb-1">{i18n.t("alphaZoo.zoo")}</label>
@@ -863,6 +877,19 @@ function BenchView() {
             className="w-full px-3 py-2 rounded-lg border border-border/60 bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50"
           />
         </div>
+        <div>
+          <label htmlFor="bench-alpha-ids" className="text-xs text-muted-foreground block mb-1">
+            {i18n.language.toLowerCase().startsWith("zh") ? "因子 ID（可选）" : "Factor IDs (optional)"}
+          </label>
+          <input
+            id="bench-alpha-ids"
+            value={alphaIdsText}
+            onChange={(e) => setAlphaIdsText(e.target.value)}
+            disabled={busy}
+            placeholder="alpha101_001"
+            className="w-full px-3 py-2 rounded-lg border border-border/60 bg-background font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50"
+          />
+        </div>
         <div className="flex flex-col gap-1">
           <button
             type="submit"
@@ -882,7 +909,7 @@ function BenchView() {
         </div>
         {formError && (
           <p
-            className="sm:col-span-2 lg:col-span-5 text-xs text-red-600 dark:text-red-400"
+            className="sm:col-span-2 lg:col-span-6 text-xs text-red-600 dark:text-red-400"
             role="alert"
           >
             {formError}
@@ -896,7 +923,15 @@ function BenchView() {
       )}
 
       {/* Result */}
-      {result && <ResultPanel result={result} />}
+      {result && (
+        <ResultPanel
+          result={result}
+          zoo={resultContext.zoo}
+          universe={resultContext.universe}
+          period={resultContext.period}
+          alphaIds={resultContext.alphaIds}
+        />
+      )}
     </div>
   );
 }
@@ -941,9 +976,22 @@ function ProgressPanel({
   );
 }
 
-function ResultPanel({ result }: { result: AlphaBenchResult }) {
+function ResultPanel({
+  result,
+  zoo,
+  universe,
+  period,
+  alphaIds,
+}: {
+  result: AlphaBenchResult;
+  zoo: string;
+  universe: string;
+  period: string;
+  alphaIds: string[];
+}) {
   const dark = useThemeDark();
   const chartRef = useRef<HTMLDivElement>(null);
+  const [view, setView] = useState<"summary" | "dashboard">("summary");
 
   useEffect(() => {
     if (!chartRef.current) return;
@@ -996,7 +1044,7 @@ function ResultPanel({ result }: { result: AlphaBenchResult }) {
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
       chart.dispose();
     };
-  }, [result, dark]);
+  }, [result, dark, view]);
 
   const totals = [
     { label: i18n.t("alphaZoo.alive"), value: result.alive, icon: CheckCircle2, tone: "text-green-600 dark:text-green-400" },
@@ -1007,6 +1055,31 @@ function ResultPanel({ result }: { result: AlphaBenchResult }) {
 
   return (
     <div className="space-y-4">
+      <div className="flex justify-end">
+        <div className="inline-flex border border-border/70 bg-card p-1" aria-label="Result view">
+          <button
+            type="button"
+            onClick={() => setView("summary")}
+            className={cn("inline-flex items-center gap-1.5 px-3 py-1.5 text-xs transition", view === "summary" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}
+          >
+            <List className="h-3.5 w-3.5" aria-hidden="true" />
+            {i18n.language.toLowerCase().startsWith("zh") ? "摘要" : "Summary"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setView("dashboard")}
+            className={cn("inline-flex items-center gap-1.5 px-3 py-1.5 text-xs transition", view === "dashboard" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}
+          >
+            <LayoutDashboard className="h-3.5 w-3.5" aria-hidden="true" />
+            {i18n.language.toLowerCase().startsWith("zh") ? "研究 Dashboard" : "Research dashboard"}
+          </button>
+        </div>
+      </div>
+
+      {view === "dashboard" ? (
+        <FactorResearchDashboard result={result} zoo={zoo} universe={universe} period={period} alphaIds={alphaIds} />
+      ) : (
+        <>
       {/* Stat cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {totals.map(({ label, value, icon: Icon, tone }) => (
@@ -1034,6 +1107,8 @@ function ResultPanel({ result }: { result: AlphaBenchResult }) {
           </h3>
           <div ref={chartRef} style={{ height: 240 }} />
         </div>
+      )}
+        </>
       )}
     </div>
   );
