@@ -1,6 +1,6 @@
 """Shared data models for backtest engines.
 
-Immutable dataclasses for positions, trades, and equity snapshots.
+Immutable dataclasses for positions, fills, trades, and equity snapshots.
 """
 
 from __future__ import annotations
@@ -23,9 +23,6 @@ class Position:
         leverage: Effective leverage (1 for spot/stocks).
         entry_bar_idx: Index in the dates array at entry (for holding_bars).
         entry_commission: Commission paid at entry.
-        last_increase_time: Most recent add-on fill.  T+1 markets use this to
-            conservatively prevent selling a mixed-vintage position on the
-            same day as an increase.
     """
 
     symbol: str
@@ -36,7 +33,30 @@ class Position:
     leverage: float = 1.0
     entry_bar_idx: int = 0
     entry_commission: float = 0.0
-    last_increase_time: pd.Timestamp | None = None
+
+
+@dataclass(frozen=True)
+class FillRecord:
+    """Immutable evidence for one executed position delta.
+
+    ``margin`` is the margin-equivalent traded value at the execution price;
+    it is evidence for turnover, not a second source of account state.
+    ``holding_bars`` is populated only for reducing fills and is derived from
+    prior fill evidence under the engine's proportional compressed-position
+    accounting.
+    """
+
+    symbol: str
+    timestamp: pd.Timestamp
+    bar_idx: int
+    action: str
+    signed_quantity: float
+    notional: float
+    execution_price: float
+    fee: float
+    margin: float
+    reason: str
+    holding_bars: float | None = None
 
 
 @dataclass(frozen=True)
@@ -72,7 +92,7 @@ class TradeRecord:
     pnl: float
     pnl_pct: float
     exit_reason: str
-    holding_bars: int
+    holding_bars: float
     commission: float
     entry_margin: float = 0.0
     exit_margin: float = 0.0

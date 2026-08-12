@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from backtest.models import TradeRecord
+from backtest.models import FillRecord, TradeRecord
 
 # ─── Annualisation factor mapping ───
 
@@ -430,6 +430,31 @@ def calc_trade_turnover_series(
     return (traded_margin / denominator).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
+def calc_fill_turnover_series(
+    fills: List[FillRecord],
+    equity_curve: pd.Series,
+) -> pd.Series:
+    """Per-bar turnover from immutable execution-fill evidence."""
+    if equity_curve is None or equity_curve.empty:
+        return pd.Series(dtype=float)
+
+    traded_margin = pd.Series(0.0, index=equity_curve.index, dtype=float)
+    for fill in fills:
+        try:
+            margin_value = float(fill.margin)
+        except (TypeError, ValueError):
+            continue
+        if (
+            fill.timestamp in traded_margin.index
+            and np.isfinite(margin_value)
+            and margin_value > 0
+        ):
+            traded_margin.loc[fill.timestamp] += margin_value
+
+    denominator = 2.0 * equity_curve.abs().replace(0.0, np.nan)
+    return (traded_margin / denominator).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
 def calc_metrics(
     equity_curve: pd.Series,
     trades: List[TradeRecord],
@@ -506,7 +531,11 @@ def calc_metrics(
         sharpe = 0.0
 
     # Drawdown
-    peak = equity_curve.cummax()
+    # The account starts at ``initial_cash`` before the first recorded bar, so
+    # that value is the initial high-water mark.  Using only observed equity
+    # understates a first-bar loss and makes drawdown nonsensical after equity
+    # crosses zero.
+    peak = equity_curve.cummax().clip(lower=float(initial_cash))
     dd = (equity_curve - peak) / peak.replace(0, 1)
     max_dd = float(dd.min())
 

@@ -44,6 +44,9 @@ def _build_rule_engines(config: dict, codes: List[str]) -> Dict[str, BaseEngine]
         elif market == "kr_equity":
             from backtest.engines.korea_equity import KoreaEquityEngine
             engines["kr_equity"] = KoreaEquityEngine(config)
+        elif market == "ca_equity":
+            from backtest.engines.global_equity import GlobalEquityEngine
+            engines["ca_equity"] = GlobalEquityEngine(config, market="ca")
         elif market == "crypto":
             from backtest.engines.crypto import CryptoEngine
             engines["crypto"] = CryptoEngine(config)
@@ -168,14 +171,9 @@ class CompositeEngine(BaseEngine):
                 bar_date = None
                 if hasattr(bar, "name") and hasattr(bar.name, "date"):
                     bar_date = bar.name.date()
-                lock_time = (
-                    pos.last_increase_time
-                    if pos.last_increase_time is not None
-                    else pos.entry_time
-                )
                 entry_date = (
-                    lock_time.date()
-                    if hasattr(lock_time, "date")
+                    pos.entry_time.date()
+                    if hasattr(pos.entry_time, "date")
                     else None
                 )
                 if bar_date and entry_date and bar_date == entry_date:

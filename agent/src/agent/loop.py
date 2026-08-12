@@ -62,6 +62,7 @@ COLLAPSE_HEAD = 900
 COLLAPSE_TAIL = 500
 
 TAIL_TOKEN_BUDGET = 20_000
+SUMMARY_CHUNK_CHARS = 80_000
 
 
 def _override(name: str):
@@ -223,6 +224,83 @@ def estimate_tokens(messages: list) -> int:
         Estimated token count.
     """
     return len(json.dumps(messages, default=str, ensure_ascii=False)) // 4
+
+
+def _summary_chunks(msgs: list, limit: int = SUMMARY_CHUNK_CHARS) -> list[str]:
+    """Serialize messages into bounded chunks for lossless summary folding.
+
+    Messages are packed by whole-message boundaries so that ordinary chunks
+    remain valid JSON arrays and a summary call never receives a message that
+    was silently cut off. A single oversized message is split into explicitly
+    labeled raw-JSON fragments instead: the label tells the summarizer that a
+    fragment is not valid JSON by itself, while retaining every character
+    instead of dropping or silently truncating part of the conversation.
+
+    Args:
+        msgs: Messages to serialize and divide into chunks.
+        limit: Maximum number of characters allowed in each returned chunk.
+
+    Returns:
+        JSON-array strings, or labeled raw-JSON fragments for an oversized
+        message, each no longer than ``limit`` characters.
+
+    Raises:
+        ValueError: If ``limit`` cannot accommodate an empty JSON array or an
+            oversized-message fragment label.
+    """
+    if limit < 2:
+        raise ValueError("summary chunk limit must be at least 2 characters")
+
+    serialized = [json.dumps(msg, default=str, ensure_ascii=False) for msg in msgs]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 2  # The opening and closing brackets.
+
+    def flush_current() -> None:
+        nonlocal current, current_len
+        if current:
+            chunks.append("[" + ", ".join(current) + "]")
+            current = []
+            current_len = 2
+
+    for part in serialized:
+        # The two brackets are part of the chunk, so a message that only fits
+        # below ``limit`` as a raw JSON string may still need fragmentation.
+        if len(part) + 2 <= limit:
+            projected_len = current_len + len(part) + (2 if current else 0)
+            if current and projected_len > limit:
+                flush_current()
+            current.append(part)
+            current_len += len(part) + (2 if len(current) > 1 else 0)
+            continue
+
+        flush_current()
+
+        def fragment_prefix(index: int, total: int) -> str:
+            return (
+                f"[fragment {index}/{total} of one oversized message — "
+                "raw JSON slice, not valid JSON on its own]\n"
+            )
+
+        total = 1
+        while True:
+            capacity = limit - len(fragment_prefix(total, total))
+            if capacity <= 0:
+                raise ValueError(
+                    "summary chunk limit is too small for an oversized-message label"
+                )
+            needed = max(1, (len(part) + capacity - 1) // capacity)
+            if needed <= total:
+                break
+            total = needed
+
+        for index in range(1, total + 1):
+            prefix = fragment_prefix(index, total)
+            start = (index - 1) * capacity
+            chunks.append(prefix + part[start : start + capacity])
+
+    flush_current()
+    return chunks or ["[]"]
 
 
 def _microcompact(messages: list) -> None:
@@ -611,6 +689,63 @@ class AgentLoop:
         """
         self._cancel_event.set()
 
+    def _write_run_manifest(self, trace_dir: "Path", messages: List[Dict[str, Any]]) -> None:
+        """Record what methodology produced this run, beside its trace.
+
+        Answers "under what system prompt, which skills, and which tool set was
+        that number produced" -- the question a reproducibility review asks and
+        that nothing in this repo could previously answer. Written once per run
+        as ``run_manifest.json`` next to ``trace.jsonl``.
+
+        The system-prompt hash transitively covers every skill injected at
+        context-build time, because those skills ARE part of the prompt string.
+        Skills pulled mid-run via ``load_skill`` are not, and appear in the
+        trace instead; the manifest says so rather than implying coverage it
+        does not have.
+
+        The prompt itself is never stored -- only its hash. The prompt can carry
+        user memory and workspace content, and this file is a provenance record,
+        not a second copy of the conversation.
+
+        Args:
+            trace_dir: Directory holding this run's trace.
+            messages: The fully built message list about to be sent.
+
+        Note:
+            Never raises. A provenance record that can break a run is worse than
+            a missing one; a failure is logged and the run continues.
+        """
+        try:
+            from datetime import datetime, timezone
+
+            from src.governance.manifest import (
+                build_run_manifest,
+                collect_key_package_versions,
+            )
+
+            system_prompt = next(
+                (m.get("content", "") for m in messages if m.get("role") == "system"), ""
+            )
+            manifest = build_run_manifest(
+                run_id=f"iter-{self._run_iteration + 1}",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                system_prompt=str(system_prompt),
+                tool_names=list(self.registry.tool_names),
+                package_versions=collect_key_package_versions(),
+                extra={
+                    "skill_coverage": (
+                        "skills injected at context-build time are inside the "
+                        "hashed system prompt; skills loaded mid-run via "
+                        "load_skill appear in trace.jsonl, not here"
+                    ),
+                },
+            )
+            path = trace_dir / "run_manifest.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(manifest.to_json(indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("run manifest not written (%s: %s)", type(exc).__name__, exc)
+
     def run(self, user_message: str, history: Optional[List[Dict[str, Any]]] = None, session_id: str = "") -> Dict[str, Any]:
         """Run the ReAct loop synchronously.
 
@@ -664,6 +799,7 @@ class AgentLoop:
 
         trace_dir = SESSIONS_DIR / session_id if session_id else run_dir
         trace = TraceWriter(trace_dir)
+        self._write_run_manifest(trace_dir, messages)
         if self._run_iteration == 0 and trace.path.exists():
             existing = TraceWriter.read(trace_dir)
             self._run_iteration = max(
@@ -1853,20 +1989,28 @@ class AgentLoop:
         # Build focus section
         focus_section = _FOCUS_SECTION.format(topic=focus_topic) if focus_topic else ""
 
-        # Build summary prompt (structured template or iterative update)
-        conv_text = json.dumps(head, default=str, ensure_ascii=False)[:80000]
+        # Fold every head chunk so no message falls between the summary prompt
+        # and the preserved tail. The first fresh chunk gets the full
+        # structured handoff; subsequent chunks incrementally update it.
+        chunks = _summary_chunks(head)
+        logger.info("Auto compact: folding %d summary chunks", len(chunks))
+        summary = self._previous_summary or ""
+        for conv_text in chunks:
+            # Structured template while there is still nothing to update — that
+            # covers a fresh session's first chunk and the corner case where
+            # every fold so far returned empty content.
+            if not summary:
+                prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
+            else:
+                prompt = _ITERATIVE_UPDATE_PROMPT.format(
+                    previous_summary=summary,
+                    new_turns=conv_text,
+                    focus_section=focus_section,
+                )
 
-        if self._previous_summary:
-            prompt = _ITERATIVE_UPDATE_PROMPT.format(
-                previous_summary=self._previous_summary,
-                new_turns=conv_text,
-                focus_section=focus_section,
-            )
-        else:
-            prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
-
-        summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
-        summary = summary_resp.content or ""
+            summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
+            if summary_resp.content:
+                summary = summary_resp.content
         self._previous_summary = summary
 
         tokens_before = estimate_tokens(messages)
@@ -1876,6 +2020,7 @@ class AgentLoop:
                 "iter": iteration,
                 "tokens_before": tokens_before,
                 "focus_topic": focus_topic or "(none)",
+                "summary_chunks": len(chunks),
             },
             field="summary",
             value=summary,

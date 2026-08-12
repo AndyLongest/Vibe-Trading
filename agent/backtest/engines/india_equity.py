@@ -82,12 +82,7 @@ class IndiaEquityEngine(BaseEngine):
             pos = self.positions.get(symbol)
             if pos is not None:
                 bar_date = _bar_date(bar)
-                lock_time = (
-                    pos.last_increase_time
-                    if pos.last_increase_time is not None
-                    else pos.entry_time
-                )
-                entry_date = lock_time.date() if hasattr(lock_time, "date") else None
+                entry_date = pos.entry_time.date() if hasattr(pos.entry_time, "date") else None
                 if bar_date is not None and entry_date is not None and bar_date == entry_date:
                     return False
 

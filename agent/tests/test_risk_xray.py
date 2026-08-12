@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from backtest.risk_xray import (
+    _drawdown,
     average_invested_weights,
     compute_risk_xray,
     render_risk_xray_markdown,
@@ -117,6 +118,24 @@ def test_max_drawdown_on_hand_built_curve():
     result = compute_risk_xray(closes, {"AAA": 1.0}, min_history=2)
     assert result["drawdown"]["max_drawdown"] == pytest.approx(-0.5)
     _assert_strict_json(result)
+
+
+def test_drawdown_uses_initial_wealth_before_first_return():
+    dates = pd.date_range("2026-01-02", periods=2, freq="D")
+
+    result = _drawdown(pd.Series([-0.2, 0.125], index=dates))
+
+    assert result["max_drawdown"] == pytest.approx(-0.2)
+    assert result["max_drawdown_start"] == str(dates[0])
+
+
+def test_drawdown_remains_negative_after_wealth_crosses_zero():
+    dates = pd.date_range("2026-01-02", periods=3, freq="D")
+
+    result = _drawdown(pd.Series([-1.2, 1.5, 1.0], index=dates))
+
+    assert result["max_drawdown"] == pytest.approx(-2.0)
+    assert result["max_drawdown_trough"] == str(dates[-1])
 
 
 def test_expected_shortfall_on_known_tail():
@@ -358,13 +377,15 @@ def test_run_backtest_emits_risk_xray_artifacts(tmp_path):
     assert out_json.exists() and out_md.exists()
     payload = json.loads(out_json.read_text(encoding="utf-8"))
     _assert_strict_json(payload)
-    # constant 1.0 signals normalize to an even two-name basket
-    assert payload["concentration"]["hhi"] == pytest.approx(0.5)
+    # The opening target is even, but actual weights drift with each symbol's
+    # realized price path; the x-ray must reflect execution truth, not preserve
+    # the optimizer's idealized 50/50 weights.
+    assert payload["concentration"]["hhi"] == pytest.approx(0.5010936725)
     assert set(payload["inputs"]["symbols"]) == {"AAA", "BBB"}
     assert "# Portfolio Risk X-Ray" in out_md.read_text(encoding="utf-8")
 
-    assert metrics["risk_xray_hhi"] == pytest.approx(0.5)
-    assert metrics["risk_xray_effective_n"] == pytest.approx(2.0)
+    assert metrics["risk_xray_hhi"] == pytest.approx(payload["concentration"]["hhi"])
+    assert metrics["risk_xray_effective_n"] == pytest.approx(payload["concentration"]["effective_n"])
     assert metrics["risk_xray_annualized_vol"] is not None
     # Execution truth has two flat observations: the initial next-bar-open
     # signal lag and the terminal liquidation.  The old target-frame report

@@ -35,6 +35,7 @@ from pydantic_core import PydanticSerializationError, to_jsonable_python
 from src.agent.tools import BaseTool
 from src.config.schema import (
     ROBINHOOD_AGENT_CONFIG_PATH,
+    MCPOAuthConfig,
     MCPServerConfig,
     live_broker_key_for_entry,
     robinhood_readonly_enabled_tools,
@@ -63,14 +64,56 @@ _MCP_SPECS_CACHE: dict[tuple[str, ...], list["MCPRemoteToolSpec"]] = {}
 _MCP_SPECS_LOCK = threading.Lock()
 
 
+def _fingerprint(text: str) -> str:
+    """One-way fingerprint for a cache-key component that may carry secrets."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_auth(auth: MCPOAuthConfig | None) -> str:
+    """Fingerprint an MCP server's OAuth config, never storing it raw.
+
+    ``MCPOAuthConfig.client_secret`` is a real credential, so the whole
+    config is hashed as one unit rather than spread across raw tuple
+    elements.
+    """
+    if auth is None:
+        return _fingerprint("")
+    canonical = "|".join(
+        [
+            auth.type,
+            str(sorted(auth.scopes)),
+            auth.client_name,
+            auth.cache_dir,
+            str(auth.callback_port),
+            auth.client_id or "",
+            auth.client_secret or "",
+            auth.client_metadata_url or "",
+        ]
+    )
+    return _fingerprint(canonical)
+
+
 def _make_cache_key(server_name: str, server_config: "MCPServerConfig") -> tuple[str, ...]:
-    """Build a content-based cache key for MCP tool discovery results."""
+    """Build a content-based cache key for MCP tool discovery results.
+
+    Every field that can change the tool specs a server returns must
+    participate in cache identity (mirrors the enabled_tools fix this cache
+    key already went through once). ``url``, ``headers``, and ``auth`` are
+    fingerprinted rather than stored raw: a URL can carry a credential in
+    its query string, a header can carry a static bearer token, and
+    ``auth`` can carry an OAuth client secret. None of those should sit as
+    plaintext in a process-wide in-memory cache key.
+    """
     return (
         server_name,
+        str(server_config.type),
         server_config.command,
         str(server_config.args or []),
         str(sorted((server_config.env or {}).items())),
         str(sorted(server_config.enabled_tools or [])),
+        _fingerprint(server_config.url or ""),
+        _fingerprint(str(sorted((server_config.headers or {}).items()))),
+        _fingerprint_auth(server_config.auth),
     )
 
 
