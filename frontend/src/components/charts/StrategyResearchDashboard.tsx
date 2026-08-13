@@ -123,6 +123,7 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
   const navRef = useRef<HTMLDivElement>(null);
   const riskRef = useRef<HTMLDivElement>(null);
   const tradesRef = useRef<HTMLDivElement>(null);
+  const greeksRef = useRef<HTMLDivElement>(null);
   const dark = useThemeDark();
 
   const equityRows = useMemo<Array<Record<string, string>>>(() => {
@@ -134,13 +135,16 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
     }));
   }, [run.artifacts_equity_csv, run.equity_curve]);
   const trades = run.artifacts_trades_csv || run.trade_log || [];
+  const greeks = run.artifacts_greeks_csv || [];
+  const rejections = run.artifacts_rejections_csv || [];
   const identity = useMemo(() => getStrategyReportIdentity(run), [run]);
+  const isOptions = identity.engine.toLowerCase() === "options";
 
   useEffect(() => {
-    const nodes = [navRef.current, riskRef.current, tradesRef.current];
+    const nodes = [navRef.current, riskRef.current, tradesRef.current, ...(greeksRef.current ? [greeksRef.current] : [])];
     if (nodes.some((node) => !node)) return;
     const charts = nodes.map((node) => echarts.init(node!));
-    const [navChart, riskChart, tradeChart] = charts;
+    const [navChart, riskChart, tradeChart, greeksChart] = charts;
     const theme = getChartTheme();
     const axis = {
       axisLine: { lineStyle: { color: theme.axisColor } },
@@ -166,8 +170,20 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
       ],
     });
 
-    const drawdown = equityRows.map((row) => num(row.drawdown));
-    const sharpe = rollingSharpe(equityRows);
+    const runningPeak: number[] = [];
+    const derivedRows = equityRows.map((row, index) => {
+      const equity = num(row.equity);
+      const prior = index > 0 ? num(equityRows[index - 1].equity) : null;
+      const peak = Math.max(index > 0 ? runningPeak[index - 1] : -Infinity, equity ?? -Infinity);
+      runningPeak.push(peak);
+      return {
+        ...row,
+        ret: row.ret || (equity != null && prior != null && prior !== 0 ? String(equity / prior - 1) : ""),
+        drawdown: row.drawdown || (equity != null && Number.isFinite(peak) && peak !== 0 ? String(equity / peak - 1) : ""),
+      };
+    });
+    const drawdown = derivedRows.map((row) => num(row.drawdown));
+    const sharpe = rollingSharpe(derivedRows);
     riskChart.setOption({
       backgroundColor: "transparent",
       tooltip: { trigger: "axis" },
@@ -194,6 +210,32 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
       series: [{ type: "bar", barMaxWidth: 12, data: exits.map((trade) => { const value = num(trade.pnl) || 0; return { value, itemStyle: { color: value >= 0 ? GREEN : ORANGE } }; }) }],
     });
 
+    if (greeksChart) {
+      const greekDates = greeks.map(timestamp);
+      const greekSeries = [
+        ["Delta", "delta", BLUE],
+        ["Gamma", "gamma", GREEN],
+        ["Theta", "theta", ORANGE],
+        ["Vega", "vega", DEEP_BLUE],
+      ] as const;
+      greeksChart.setOption({
+        backgroundColor: "transparent",
+        tooltip: { trigger: "axis" },
+        legend: { top: 0, right: 4, textStyle: { color: theme.textColor, fontSize: 10 } },
+        grid: { left: 18, right: 24, top: 32, bottom: 18, containLabel: true },
+        xAxis: { ...axis, type: "category", data: greekDates, boundaryGap: false },
+        yAxis: { ...axis, type: "value", scale: true },
+        series: greekSeries.map(([name, key, color]) => ({
+          name,
+          type: "line",
+          showSymbol: false,
+          data: greeks.map((row) => num(row[key])),
+          lineStyle: { color, width: 1.6 },
+          itemStyle: { color },
+        })),
+      });
+    }
+
     let frame: number | null = null;
     const observer = new ResizeObserver(() => {
       if (frame != null) cancelAnimationFrame(frame);
@@ -205,7 +247,7 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
       if (frame != null) cancelAnimationFrame(frame);
       charts.forEach((chart) => chart.dispose());
     };
-  }, [dark, equityRows, trades]);
+  }, [dark, equityRows, trades, greeks]);
 
   const metrics: Record<string, number> = run.metrics || {};
   const kpis = [
@@ -234,6 +276,7 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
             {(identity.startDate || identity.endDate) && <span className="inline-flex items-center gap-1.5 rounded-md border border-border/70 bg-background/65 px-2.5 py-1.5"><CalendarRange className="h-3.5 w-3.5 text-[#3676df]" />{identity.startDate || "—"} — {identity.endDate || "—"}</span>}
             {identity.engine && <span className="inline-flex items-center gap-1.5 rounded-md border border-border/70 bg-background/65 px-2.5 py-1.5"><FlaskConical className="h-3.5 w-3.5 text-[#3676df]" />{identity.engine.toUpperCase()} {tr("engine", "回测引擎")}</span>}
             {identity.source && <span className="inline-flex items-center gap-1.5 rounded-md border border-border/70 bg-background/65 px-2.5 py-1.5"><Database className="h-3.5 w-3.5 text-[#3676df]" />{identity.source}</span>}
+            {isOptions && <span className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-amber-700 dark:text-amber-300">{tr("Synthetic BS pricing · not historical option quotes", "Black–Scholes 合成定价 · 非历史期权成交价")}</span>}
           </div>
         </div>
       </header>
@@ -246,11 +289,17 @@ export function StrategyResearchDashboard({ run }: { run: RunData }) {
         <section className="space-y-3"><FigureTitle index="01" title={tr("Equity and benchmark", "净值与基准")} note={tr("Compare the strategy's growth path with its benchmark.", "比较策略与基准的累计收益路径。")} /><div ref={navRef} className="h-[320px] border border-[#dfe2e7] bg-background/40" /></section>
         <section className="space-y-3"><FigureTitle index="02" title={tr("Drawdown and rolling risk", "回撤与滚动风险")} note={tr("See when losses deepened and risk-adjusted performance changed.", "观察亏损加深和风险调整后表现发生变化的时点。")} /><div ref={riskRef} className="h-[300px] border border-[#dfe2e7] bg-background/40" /></section>
         <section className="space-y-3"><FigureTitle index="03" title={tr("Realized trade P&L", "已实现成交盈亏")} note={tr("Profit and loss from completed trades.", "展示已完成交易带来的实际盈亏。")} /><div ref={tradesRef} className="h-[260px] border border-[#dfe2e7] bg-background/40" /></section>
-        <section className="space-y-3"><FigureTitle index="04" title={tr("Trade ledger", "成交明细")} note={tr("Review the latest 100 trades in chronological detail.", "按时间查看最近 100 笔交易明细。")} /><TradeTable rows={trades.slice(-100).reverse()} /></section>
-        <section className="space-y-3"><FigureTitle index="05" title={tr("Performance metrics", "绩效指标")} note={tr("A complete summary of return, risk, and trading statistics.", "汇总策略的收益、风险与交易统计。")} /><MetricTable metrics={metrics} /></section>
+        {isOptions && greeks.length > 0 && <section className="space-y-3"><FigureTitle index="04" title={tr("Portfolio Greeks", "期权组合 Greeks")} note={tr("Daily aggregate Delta, Gamma, Theta and Vega from synthetic marks.", "基于合成定价的每日 Delta、Gamma、Theta 与 Vega 汇总。")} /><div ref={greeksRef} className="h-[300px] border border-[#dfe2e7] bg-background/40" /></section>}
+        {isOptions && rejections.length > 0 && <section className="space-y-3"><FigureTitle index="05" title={tr("Rejected structures", "被拒绝的期权结构")} note={tr("Orders rejected atomically because premium and margin exceeded buying power.", "因权利金与保证金超过购买力而被整体拒绝的订单。")} /><RejectionTable rows={rejections} /></section>}
+        <section className="space-y-3"><FigureTitle index={isOptions ? "06" : "04"} title={tr("Trade ledger", "成交明细")} note={tr("Review the latest 100 trades in chronological detail.", "按时间查看最近 100 笔交易明细。")} /><TradeTable rows={trades.slice(-100).reverse()} /></section>
+        <section className="space-y-3"><FigureTitle index={isOptions ? "07" : "05"} title={tr("Performance metrics", "绩效指标")} note={tr("A complete summary of return, risk, and trading statistics.", "汇总策略的收益、风险与交易统计。")} /><MetricTable metrics={metrics} /></section>
       </div>
     </article>
   );
+}
+
+function RejectionTable({ rows }: { rows: Array<Record<string, string>> }) {
+  return <div className="max-h-[320px] overflow-auto border border-[#dfe2e7]"><table className="w-full min-w-[680px] text-xs"><thead className="sticky top-0 bg-[#f5f7fa] text-muted-foreground dark:bg-slate-900"><tr><th className="px-3 py-2 text-left">Time</th><th className="px-3 py-2 text-left">Underlying</th><th className="px-3 py-2 text-left">Reason</th><th className="px-3 py-2 text-right">Cash after premium</th><th className="px-3 py-2 text-right">Required margin</th><th className="px-3 py-2 text-right">Legs</th></tr></thead><tbody>{rows.map((row, index) => <tr key={`${row.timestamp}-${index}`} className="border-t border-[#dfe2e7]"><td className="px-3 py-2 font-mono">{row.timestamp || "—"}</td><td className="px-3 py-2 font-mono">{row.underlying || "—"}</td><td className="px-3 py-2 text-amber-700 dark:text-amber-300">{row.reason || "—"}</td><td className="px-3 py-2 text-right font-mono">{fixed(row.cash_after_premium)}</td><td className="px-3 py-2 text-right font-mono">{fixed(row.required_margin)}</td><td className="px-3 py-2 text-right font-mono">{row.legs || "—"}</td></tr>)}</tbody></table></div>;
 }
 
 function TradeTable({ rows }: { rows: Array<Record<string, string>> }) {

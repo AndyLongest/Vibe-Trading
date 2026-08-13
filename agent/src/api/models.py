@@ -77,6 +77,12 @@ class RunResponse(BaseModel):
     artifacts_equity_csv: Optional[List[Dict[str, Any]]] = Field(None, description="Full equity rows")
     artifacts_metrics_csv: Optional[List[Dict[str, Any]]] = Field(None, description="Full metrics rows")
     artifacts_trades_csv: Optional[List[Dict[str, Any]]] = Field(None, description="Full trade rows")
+    artifacts_greeks_csv: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Daily aggregate option Greeks"
+    )
+    artifacts_rejections_csv: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Rejected option structures and buying-power reasons"
+    )
     artifacts_positions_csv: Optional[List[Dict[str, Any]]] = Field(
         None, description="Actual post-execution position weights"
     )

@@ -249,6 +249,30 @@ def test_api_run_response_includes_llm_usage(tmp_path: Path) -> None:
     assert response.llm_usage == llm_usage
 
 
+def test_api_run_response_includes_option_risk_artifacts(tmp_path: Path) -> None:
+    import api_server
+
+    run_dir = tmp_path / "options_run"
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    (run_dir / "state.json").write_text('{"status": "success"}\n', encoding="utf-8")
+    (artifacts / "greeks.csv").write_text(
+        "timestamp,delta,gamma,theta,vega,rho,num_positions\n"
+        "2025-01-02,0.5,0.02,-0.1,0.3,0.01,1\n",
+        encoding="utf-8",
+    )
+    (artifacts / "rejections.csv").write_text(
+        "timestamp,underlying,action,reason,cash_after_premium,required_margin,legs\n"
+        "2025-01-02,SPY,open,insufficient_buying_power,-10,100,2\n",
+        encoding="utf-8",
+    )
+
+    response = api_server._build_response_from_run_dir(run_dir, elapsed=0.0)
+
+    assert response.artifacts_greeks_csv[0]["delta"] == "0.5"
+    assert response.artifacts_rejections_csv[0]["reason"] == "insufficient_buying_power"
+
+
 def test_runner_artifact_spec_surfaces_run_card_paths() -> None:
     runner = Runner()
 

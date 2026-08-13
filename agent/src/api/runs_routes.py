@@ -175,6 +175,14 @@ def _build_response_from_run_dir(
     if trades_path.exists():
         response.artifacts_trades_csv = _load_csv_to_dict(trades_path)
 
+    greeks_path = run_dir / "artifacts" / "greeks.csv"
+    if greeks_path.exists():
+        response.artifacts_greeks_csv = _load_csv_to_dict(greeks_path)
+
+    rejections_path = run_dir / "artifacts" / "rejections.csv"
+    if rejections_path.exists():
+        response.artifacts_rejections_csv = _load_csv_to_dict(rejections_path)
+
     positions_path = run_dir / "artifacts" / "positions.csv"
     if positions_path.exists():
         response.artifacts_positions_csv = _load_csv_to_dict(positions_path)

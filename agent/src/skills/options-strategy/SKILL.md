@@ -18,13 +18,15 @@ Applicable scenarios:
 
 | Strategy | Structure | Applicable Market View |
 |------|------|----------|
-| Covered Call | Hold underlying + short call | Mildly bullish, collect premium |
-| Protective Put | Hold underlying + long put | Bullish but wants downside protection |
 | Straddle | Buy same-strike call + put | Expect large movement, direction uncertain |
 | Strangle | Buy different-strike call + put | Expect large movement, lower cost |
 | Iron Condor | Sell put spread + sell call spread | Range-bound market, collect premium |
 | Butterfly | Buy low call + sell 2 middle calls + buy high call | Expect narrow-range movement |
 | Calendar Spread | Sell near-month + buy far-month at same strike | Exploit differences in time decay |
+
+The portfolio engine currently holds option legs only. A short call or long put
+can be priced, but it is **not** a covered call or protective put unless the
+underlying position is accounted for in a separate combined portfolio model.
 
 ## `OptionsSignalEngine` Interface
 
@@ -100,6 +102,18 @@ Key fields:
 - `options_config.risk_free_rate`: risk-free rate, default `0.05`
 - `options_config.iv_source`: volatility source, currently supports `"historical"` (30-day rolling historical volatility computed from underlying closes)
 - `options_config.contract_multiplier`: contract multiplier, default `1.0`
+- `options_config.exercise_style`: `"european"` (default) or the engine's
+  heuristic `"american"` mode
+- `options_config.enforce_capital_constraints`: defaults to `true`; long premium
+  and conservative naked-short margin must fit available buying power
+- `options_config.short_margin_rate`: underlying-value margin component,
+  default `0.20`
+- `options_config.short_margin_floor`: minimum underlying-value component,
+  default `0.10`
+
+An opening instruction is atomic: if the complete multi-leg structure exceeds
+buying power, no leg is filled and the rejection is written to
+`artifacts/rejections.csv`.
 
 ## BS Model Principles
 
@@ -140,7 +154,10 @@ Theta decay is not linear — the closer the option is to expiry, the faster the
 
 ### Early Exercise
 
-This engine supports European options only (exercise only at expiry), not American options. In scenarios with meaningful early-exercise value (for example, deep ITM puts or calls on high-dividend underlyings), pricing will be biased.
+European expiry exercise is supported. `exercise_style="american"` enables a
+simple intrinsic-versus-continuation heuristic, not an exchange-grade American
+tree/PDE model. It has no historical dividend schedule or physical-delivery
+simulation, so results with meaningful early-exercise value remain approximate.
 
 ### Liquidity and Slippage
 
@@ -160,7 +177,19 @@ After backtesting, the following files are generated in the `artifacts/` directo
 | `metrics.csv` | Return, Sharpe ratio, maximum drawdown, and similar metrics |
 | `trades.csv` | Trade-by-trade records (open / close / exercise / expire) |
 | `greeks.csv` | Daily portfolio Greeks aggregates (`delta/gamma/theta/vega`) |
+| `rejections.csv` | Multi-leg structures rejected for insufficient buying power |
 | `ohlcv_{code}.csv` | Raw underlying candlestick data |
+
+## Evidence boundary
+
+This is a synthetic option-price backtest. It loads historical **underlying**
+OHLCV, estimates volatility from past underlying returns and generates option
+marks with Black–Scholes plus an optional parametric smile. The read-only
+`get_options_chain` tool is not a historical-chain loader and is not used by the
+backtest. Therefore the engine cannot establish results based on historical
+bid/ask quotes, traded IV surfaces, open interest, exchange margin schedules or
+contract-specific settlement rules. Reports must retain the synthetic-pricing
+disclosure.
 
 ## Pricing Tool
 

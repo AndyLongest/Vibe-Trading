@@ -616,6 +616,8 @@ export interface RunData {
   artifacts_equity_csv?: Array<Record<string, string>>;
   artifacts_metrics_csv?: Array<Record<string, string>>;
   artifacts_trades_csv?: Array<Record<string, string>>;
+  artifacts_greeks_csv?: Array<Record<string, string>>;
+  artifacts_rejections_csv?: Array<Record<string, string>>;
   /** Execution truth: actual post-fill weights, never optimizer targets. */
   artifacts_positions_csv?: Array<Record<string, string>>;
   artifacts_target_positions_csv?: Array<Record<string, string>>;

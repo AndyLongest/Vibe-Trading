@@ -43,8 +43,79 @@ def historical_volatility(close: pd.Series, window: int = 30) -> pd.Series:
         Annualised historical volatility Series.
     """
     log_ret = np.log(close / close.shift(1))
-    hv = log_ret.rolling(window=window).std() * np.sqrt(252)
-    return hv.fillna(hv.dropna().iloc[0] if len(hv.dropna()) > 0 else 0.3)
+    # ``min_periods=2`` uses only observations available as of each bar.  Do
+    # not backfill the warm-up window from the first future 30-day estimate:
+    # that leaks future volatility into the beginning of the backtest.
+    hv = log_ret.rolling(window=window, min_periods=2).std() * np.sqrt(252)
+    return hv.fillna(0.3)
+
+
+def _validate_options_config(options_cfg: Dict[str, Any]) -> None:
+    """Reject unsupported or economically invalid option-engine settings."""
+    iv_source = str(options_cfg.get("iv_source", "historical")).lower()
+    if iv_source != "historical":
+        raise ValueError(
+            f"Unsupported options_config.iv_source={iv_source!r}; "
+            "only 'historical' is currently implemented"
+        )
+    exercise_style = str(options_cfg.get("exercise_style", "european")).lower()
+    if exercise_style not in {"european", "american"}:
+        raise ValueError("options_config.exercise_style must be 'european' or 'american'")
+    for key in ("contract_multiplier", "short_margin_rate", "short_margin_floor"):
+        value = float(options_cfg.get(key, 1.0 if key == "contract_multiplier" else 0.2 if key == "short_margin_rate" else 0.1))
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"options_config.{key} must be positive and finite")
+
+
+def _short_margin_requirement(
+    pos: "OptionPosition",
+    spot: float,
+    option_price: float,
+    multiplier: float,
+    margin_rate: float,
+    margin_floor: float,
+) -> float:
+    """Return a conservative naked-short initial margin requirement.
+
+    This is an OCC-style approximation, not a broker-specific schedule.  It
+    deliberately applies no spread offsets, so bounded multi-leg structures
+    remain conservative until an exchange-aware margin model is supplied.
+    """
+    if pos.qty >= 0:
+        return 0.0
+    otm = max(pos.strike - spot, 0.0) if pos.option_type == "call" else max(spot - pos.strike, 0.0)
+    per_unit = option_price + max(margin_rate * spot - otm, margin_floor * spot)
+    return per_unit * abs(pos.qty) * multiplier
+
+
+def _portfolio_short_margin(
+    positions: List["OptionPosition"],
+    spot_prices: Dict[str, float],
+    ivs: Dict[str, float],
+    ts: pd.Timestamp,
+    *,
+    risk_free_rate: float,
+    multiplier: float,
+    iv_skew: float,
+    iv_curvature: float,
+    margin_rate: float,
+    margin_floor: float,
+) -> float:
+    """Aggregate conservative margin for all open short option legs."""
+    total = 0.0
+    for pos in positions:
+        if pos.qty >= 0:
+            continue
+        spot = spot_prices.get(pos.underlying_code, 0.0)
+        base_iv = ivs.get(pos.underlying_code, 0.3)
+        iv = leg_iv(spot, pos.strike, base_iv, iv_skew, iv_curvature)
+        price = bs_price(
+            spot, pos.strike, pos.time_to_expiry(ts), risk_free_rate, iv, pos.option_type
+        )
+        total += _short_margin_requirement(
+            pos, spot, price, multiplier, margin_rate, margin_floor
+        )
+    return total
 
 
 # --- IV Smile model (v2) ---
@@ -206,11 +277,15 @@ def run_options_backtest(
     initial_cash = config.get("initial_cash", 1_000_000)
     commission = config.get("commission", 0.001)
     options_cfg = config.get("options_config", {})
+    _validate_options_config(options_cfg)
     risk_free_rate = options_cfg.get("risk_free_rate", 0.05)
     contract_multiplier = options_cfg.get("contract_multiplier", 1.0)
     exercise_style = options_cfg.get("exercise_style", "european")  # v2: "european" or "american"
     iv_skew = options_cfg.get("iv_skew", 0.0)         # v2: smile skew param (0 = flat)
     iv_curvature = options_cfg.get("iv_curvature", 0.0)  # v2: smile curvature
+    enforce_capital = options_cfg.get("enforce_capital_constraints", True) is not False
+    short_margin_rate = float(options_cfg.get("short_margin_rate", 0.20))
+    short_margin_floor = float(options_cfg.get("short_margin_floor", 0.10))
 
     # Load underlying data
     data_map = loader.fetch(codes, start_date, end_date)
@@ -244,6 +319,7 @@ def run_options_backtest(
     trade_records: List[Dict[str, Any]] = []
     greeks_records: List[Dict[str, Any]] = []
     equity_records: List[Dict[str, Any]] = []
+    rejection_records: List[Dict[str, Any]] = []
 
     for current_date in dates:
         ts = pd.Timestamp(current_date)
@@ -301,7 +377,15 @@ def run_options_backtest(
         # 2b. Handle expiry
         expired = [p for p in positions if p.is_expired(ts)]
         for pos in expired:
+            # When expiry falls on a non-trading day, settle from the last
+            # underlying bar on or before expiry.  Using the next Monday's
+            # close would introduce post-expiry information into settlement.
+            underlying_df = data_map.get(pos.underlying_code)
             spot = spot_prices.get(pos.underlying_code, 0.0)
+            if underlying_df is not None:
+                settlement_dates = underlying_df.index[underlying_df.index <= pos.expiry]
+                if len(settlement_dates) > 0:
+                    spot = float(underlying_df.at[settlement_dates[-1], "close"])
             intrinsic = pos.intrinsic_value(spot)
 
             # Expiry: recover intrinsic value (entry_price already deducted at open)
@@ -334,6 +418,7 @@ def run_options_backtest(
             spot = spot_prices.get(underlying, 0.0)
             iv_val = ivs.get(underlying, 0.3)
 
+            prepared_legs: List[Dict[str, Any]] = []
             for leg in legs:
                 # Fold before it is priced, matched and recorded: config comes
                 # from the user, and a raw "Call" would price as a call and
@@ -348,6 +433,66 @@ def run_options_backtest(
 
                 adj_iv = leg_iv(spot, strike, iv_val, iv_skew, iv_curvature)
                 opt_price = bs_price(spot, strike, T, risk_free_rate, adj_iv, leg_type)
+
+                prepared_legs.append({
+                    "raw": leg,
+                    "type": leg_type,
+                    "strike": strike,
+                    "expiry": expiry,
+                    "qty": qty,
+                    "price": opt_price,
+                })
+
+            # Opening a structure is atomic.  Price every leg first, then test
+            # the resulting cash and short-margin requirement before recording
+            # any fill.  This prevents half-built spreads and unlimited credit.
+            if action == "open" and enforce_capital:
+                prospective_cash = cash
+                prospective_positions = list(positions)
+                for prepared in prepared_legs:
+                    qty = prepared["qty"]
+                    premium = prepared["price"] * abs(qty) * contract_multiplier
+                    prospective_cash += premium * (1 - commission) if qty < 0 else -premium * (1 + commission)
+                    prospective_positions.append(OptionPosition(
+                        option_type=prepared["type"],
+                        strike=prepared["strike"],
+                        expiry=prepared["expiry"],
+                        qty=qty,
+                        entry_price=prepared["price"],
+                        entry_date=date_str,
+                        underlying_code=underlying,
+                    ))
+                required_margin = _portfolio_short_margin(
+                    prospective_positions,
+                    spot_prices,
+                    ivs,
+                    ts,
+                    risk_free_rate=risk_free_rate,
+                    multiplier=contract_multiplier,
+                    iv_skew=iv_skew,
+                    iv_curvature=iv_curvature,
+                    margin_rate=short_margin_rate,
+                    margin_floor=short_margin_floor,
+                )
+                if prospective_cash < required_margin - 1e-9:
+                    rejection_records.append({
+                        "timestamp": date_str,
+                        "underlying": underlying,
+                        "action": action,
+                        "reason": "insufficient_buying_power",
+                        "cash_after_premium": round(prospective_cash, 4),
+                        "required_margin": round(required_margin, 4),
+                        "legs": len(prepared_legs),
+                    })
+                    continue
+
+            for prepared in prepared_legs:
+                leg = prepared["raw"]
+                leg_type = prepared["type"]
+                strike = prepared["strike"]
+                expiry = prepared["expiry"]
+                qty = prepared["qty"]
+                opt_price = prepared["price"]
 
                 if action == "open":
                     # Open: long pays premium, short receives premium
@@ -501,6 +646,14 @@ def run_options_backtest(
         out / "trades.csv", index=False)
 
     pd.DataFrame(greeks_records).to_csv(out / "greeks.csv", index=False)
+    pd.DataFrame(
+        rejection_records,
+        columns=["timestamp", "underlying", "action", "reason", "cash_after_premium", "required_margin", "legs"],
+    ).to_csv(out / "rejections.csv", index=False)
+    if rejection_records:
+        metrics.setdefault("warnings", []).append(
+            f"Rejected {len(rejection_records)} option structure(s) for insufficient buying power."
+        )
     pd.DataFrame([metrics]).to_csv(out / "metrics.csv", index=False)
 
     from backtest.run_card import write_run_card
